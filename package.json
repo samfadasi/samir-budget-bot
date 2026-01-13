@@ -32,13 +32,18 @@
     "@types/pg": "^8.16.0",
     "ai": "^4.3.16",
     "dotenv": "^17.2.0",
+    "drizzle-zod": "^0.8.3",
     "exa-js": "^1.8.17",
     "inngest": "^3.40.2",
     "inngest-cli": "^1.11.5",
+    "openai": "^6.16.0",
+    "p-limit": "^7.2.0",
+    "p-retry": "^7.1.1",
     "pg": "^8.16.3",
     "pino": "^9.9.4",
     "tsx": "^4.20.3",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "zod-validation-error": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^24.6.2",
