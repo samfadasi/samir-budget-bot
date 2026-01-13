@@ -1,40 +1,11 @@
 /**
- * Telegram Trigger - Webhook-based Workflow Triggering
+ * Telegram Trigger - Webhook-based Workflow Triggering for Accounting Bot
  *
  * This module provides Telegram bot event handling for Mastra workflows.
- * When Telegram messages are received, this trigger starts your workflow.
- *
- * PATTERN:
- * 1. Import registerTelegramTrigger and your workflow
- * 2. Call registerTelegramTrigger with a triggerType and handler
- * 3. Spread the result into the apiRoutes array in src/mastra/index.ts
- *
- * USAGE in src/mastra/index.ts:
- *
- * ```typescript
- * import { registerTelegramTrigger } from "../triggers/telegramTriggers";
- * import { telegramBotWorkflow } from "./workflows/telegramBotWorkflow";
- * import { inngest } from "./inngest";
- *
- * // In the apiRoutes array:
- * ...registerTelegramTrigger({
- *   triggerType: "telegram/message",
- *   handler: async (mastra, triggerInfo) => {
- *     const run = await telegramBotWorkflow.createRunAsync();
- *     return await inngest.send({
- *       name: `workflow.${telegramBotWorkflow.id}`,
- *       data: {
- *         runId: run?.runId,
- *         inputData: {},
- *       },
- *     });
- *   }
- * })
- * ```
+ * Handles text messages, photos, voice notes, and documents (PDFs).
  */
 
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-
 import { registerApiRoute } from "../mastra/inngest";
 import { Mastra } from "@mastra/core";
 
@@ -44,14 +15,56 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
   );
 }
 
+export type MessageType = "text" | "photo" | "voice" | "document" | "unknown";
+
 export type TriggerInfoTelegramOnNewMessage = {
   type: "telegram/message";
   params: {
+    telegramUserId: number;
     userName: string;
+    firstName: string;
+    lastName: string;
+    chatId: number;
+    messageId: number;
+    messageType: MessageType;
     message: string;
+    fileId?: string;
+    fileName?: string;
+    mimeType?: string;
+    caption?: string;
   };
   payload: any;
 };
+
+function getMessageType(message: any): MessageType {
+  if (message.photo && message.photo.length > 0) return "photo";
+  if (message.voice) return "voice";
+  if (message.document) return "document";
+  if (message.text) return "text";
+  return "unknown";
+}
+
+function extractFileInfo(message: any, messageType: MessageType): { fileId?: string; fileName?: string; mimeType?: string } {
+  switch (messageType) {
+    case "photo":
+      const photos = message.photo;
+      const largestPhoto = photos[photos.length - 1];
+      return { fileId: largestPhoto?.file_id };
+    case "voice":
+      return {
+        fileId: message.voice?.file_id,
+        mimeType: message.voice?.mime_type,
+      };
+    case "document":
+      return {
+        fileId: message.document?.file_id,
+        fileName: message.document?.file_name,
+        mimeType: message.document?.mime_type,
+      };
+    default:
+      return {};
+  }
+}
 
 export function registerTelegramTrigger({
   triggerType,
@@ -71,24 +84,149 @@ export function registerTelegramTrigger({
         const logger = mastra.getLogger();
         try {
           const payload = await c.req.json();
+          logger?.info("📨 [Telegram] Received payload", { payload });
 
-          logger?.info("📝 [Telegram] payload", payload);
+          const message = payload.message;
+          if (!message) {
+            logger?.warn("📭 [Telegram] No message in payload");
+            return c.text("OK", 200);
+          }
 
-          await handler(mastra, {
-            type: triggerType,
+          const messageType = getMessageType(message);
+          const fileInfo = extractFileInfo(message, messageType);
+
+          const triggerInfo: TriggerInfoTelegramOnNewMessage = {
+            type: triggerType as "telegram/message",
             params: {
-              userName: payload.message.from.username,
-              message: payload.message.text,
+              telegramUserId: message.from?.id,
+              userName: message.from?.username || "",
+              firstName: message.from?.first_name || "",
+              lastName: message.from?.last_name || "",
+              chatId: message.chat?.id,
+              messageId: message.message_id,
+              messageType,
+              message: message.text || message.caption || "",
+              fileId: fileInfo.fileId,
+              fileName: fileInfo.fileName,
+              mimeType: fileInfo.mimeType,
+              caption: message.caption,
             },
             payload,
-          } as TriggerInfoTelegramOnNewMessage);
+          };
+
+          logger?.info("🔄 [Telegram] Processing message", {
+            messageType,
+            telegramUserId: triggerInfo.params.telegramUserId,
+            hasFile: !!fileInfo.fileId,
+          });
+
+          await handler(mastra, triggerInfo);
 
           return c.text("OK", 200);
         } catch (error) {
-          logger?.error("Error handling Telegram webhook:", error);
+          logger?.error("❌ [Telegram] Error handling webhook:", { error });
           return c.text("Internal Server Error", 500);
         }
       },
     }),
   ];
+}
+
+export async function downloadTelegramFile(fileId: string): Promise<Buffer | null> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("TELEGRAM_BOT_TOKEN not set");
+    return null;
+  }
+
+  try {
+    const fileInfoResponse = await fetch(
+      `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`
+    );
+    const fileInfo = await fileInfoResponse.json() as any;
+
+    if (!fileInfo.ok || !fileInfo.result?.file_path) {
+      console.error("Failed to get file info:", fileInfo);
+      return null;
+    }
+
+    const fileUrl = `https://api.telegram.org/file/bot${token}/${fileInfo.result.file_path}`;
+    const fileResponse = await fetch(fileUrl);
+    const arrayBuffer = await fileResponse.arrayBuffer();
+
+    return Buffer.from(arrayBuffer);
+  } catch (error) {
+    console.error("Error downloading file from Telegram:", error);
+    return null;
+  }
+}
+
+export async function sendTelegramMessage(
+  chatId: number,
+  text: string,
+  parseMode: "HTML" | "Markdown" | "MarkdownV2" = "HTML"
+): Promise<boolean> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("TELEGRAM_BOT_TOKEN not set");
+    return false;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: parseMode,
+        }),
+      }
+    );
+
+    const result = await response.json() as any;
+    return result.ok === true;
+  } catch (error) {
+    console.error("Error sending Telegram message:", error);
+    return false;
+  }
+}
+
+export async function sendTelegramDocument(
+  chatId: number,
+  document: Buffer,
+  filename: string,
+  caption?: string
+): Promise<boolean> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("TELEGRAM_BOT_TOKEN not set");
+    return false;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append("chat_id", chatId.toString());
+    const arrayBuffer = document.buffer.slice(document.byteOffset, document.byteOffset + document.byteLength) as ArrayBuffer;
+    formData.append("document", new Blob([arrayBuffer]), filename);
+    if (caption) {
+      formData.append("caption", caption);
+    }
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${token}/sendDocument`,
+      {
+        method: "POST",
+        body: formData,
+      }
+    );
+
+    const result = await response.json() as any;
+    return result.ok === true;
+  } catch (error) {
+    console.error("Error sending Telegram document:", error);
+    return false;
+  }
 }

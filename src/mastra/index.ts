@@ -9,70 +9,9 @@ import { z } from "zod";
 import { sharedPostgresStorage } from "./storage";
 import { inngest, inngestServe } from "./inngest";
 
-// ======================================================================
-// Option 1: FOR TIME-BASED (CRON) TRIGGERS
-// ======================================================================
-// Call registerCronTrigger() BEFORE the Mastra initialization below.
-//
-// Example:
-//   import { registerCronTrigger } from "../triggers/cronTriggers";
-//   import { myWorkflow } from "./workflows/myWorkflow";
-//
-//   registerCronTrigger({
-//     cronExpression: "0 8 * * *", // Daily at 8 AM
-//     workflow: myWorkflow
-//   });
-//
-// See src/triggers/cronTriggers.ts for details
-// ======================================================================
-// Option 2: FOR WEBHOOK-BASED TRIGGERS
-// ======================================================================
-// Spread trigger registration functions into this apiRoutes array.
-//
-// Pattern:
-//   import { registerYourTrigger } from "../triggers/yourTriggers";
-//   import { myWorkflow } from "./workflows/myWorkflow";
-//   import { inngest } from "./inngest";
-//
-//   ...registerYourTrigger({
-//     triggerType: "your/event.type",
-//     handler: async (mastra, triggerInfo, runId) => {
-//       // Extract what you need from the payload
-//       ...
-//
-//       // Create a run of the workflow unless one was provided
-//       if (!runId) {
-//         runId = (await myWorkflow.createRunAsync()).runId;
-//       }
-//       // Start the workflow
-//       return await inngest.send({
-//         name: `workflow.${myWorkflow.id}`,
-//         data: {
-//           runId,
-//           inputData: {
-//             // Your input data here
-//           },
-//         },
-//       });
-//     }
-//   })
-//
-// Available: src/triggers/slackTriggers.ts, telegramTriggers.ts, exampleConnectorTrigger.ts
-// ======================================================================
-
-// ======================================================================
-// IMPORT YOUR AGENTS AND WORKFLOWS
-// ======================================================================
-// Import your custom agents and workflows here.
-// See src/examples/ directory for complete examples:
-// - src/examples/exampleAgent.ts
-// - src/examples/exampleWorkflow.ts
-// - src/examples/exampleTool.ts
-//
-// Example imports:
-// import { myAgent } from "./agents/myAgent";
-// import { myWorkflow } from "./workflows/myWorkflow";
-// ======================================================================
+import { accountingAgent } from "./agents/accountingAgent";
+import { accountingWorkflow } from "./workflows/accountingWorkflow";
+import { registerTelegramTrigger } from "../triggers/telegramTriggers";
 
 class ProductionPinoLogger extends MastraLogger {
   protected logger: pino.Logger;
@@ -117,22 +56,17 @@ class ProductionPinoLogger extends MastraLogger {
 
 export const mastra = new Mastra({
   storage: sharedPostgresStorage,
-  // Register your workflows here
-  workflows: {},
-  // Register your agents here
-  agents: {},
+  workflows: { accountingWorkflow },
+  agents: { accountingAgent },
   bundler: {
-    // A few dependencies are not properly picked up by
-    // the bundler if they are not added directly to the
-    // entrypoint.
     externals: [
       "@slack/web-api",
       "inngest",
       "inngest/hono",
       "hono",
       "hono/streaming",
+      "pg",
     ],
-    // sourcemaps are good for debugging.
     sourcemap: true,
   },
   server: {
@@ -153,12 +87,9 @@ export const mastra = new Mastra({
           });
           if (error instanceof MastraError) {
             if (error.id === "AGENT_MEMORY_MISSING_RESOURCE_ID") {
-              // This is typically a non-retirable error. It means that the request was not
-              // setup correctly to pass in the necessary parameters.
               throw new NonRetriableError(error.message, { cause: error });
             }
           } else if (error instanceof z.ZodError) {
-            // Validation errors are never retriable.
             throw new NonRetriableError(error.message, { cause: error });
           }
 
@@ -167,18 +98,48 @@ export const mastra = new Mastra({
       },
     ],
     apiRoutes: [
-      // ======================================================================
-      // Inngest Integration Endpoint
-      // ======================================================================
-      // Integrates Mastra workflows with Inngest for event-driven execution via inngest functions.
       {
         path: "/api/inngest",
         method: "ALL",
         createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }),
       },
+      ...registerTelegramTrigger({
+        triggerType: "telegram/message",
+        handler: async (mastra, triggerInfo) => {
+          const logger = mastra.getLogger();
+          logger?.info("🚀 [Telegram Trigger] Starting workflow", {
+            telegramUserId: triggerInfo.params.telegramUserId,
+            messageType: triggerInfo.params.messageType,
+          });
 
-      // Add webhook triggers here (see Option 2 above)
-      // Example: ...registerSlackTrigger({ ... })
+          const run = await accountingWorkflow.createRunAsync();
+          
+          await inngest.send({
+            name: `workflow.${accountingWorkflow.id}`,
+            data: {
+              runId: run?.runId,
+              inputData: {
+                telegramUserId: triggerInfo.params.telegramUserId,
+                userName: triggerInfo.params.userName,
+                firstName: triggerInfo.params.firstName,
+                lastName: triggerInfo.params.lastName,
+                chatId: triggerInfo.params.chatId,
+                messageId: triggerInfo.params.messageId,
+                messageType: triggerInfo.params.messageType,
+                message: triggerInfo.params.message,
+                fileId: triggerInfo.params.fileId,
+                fileName: triggerInfo.params.fileName,
+                mimeType: triggerInfo.params.mimeType,
+                caption: triggerInfo.params.caption,
+              },
+            },
+          });
+
+          logger?.info("✅ [Telegram Trigger] Workflow started", {
+            runId: run?.runId,
+          });
+        },
+      }),
     ],
   },
   logger:
@@ -193,16 +154,12 @@ export const mastra = new Mastra({
         }),
 });
 
-/*  Sanity check 1: Throw an error if there are more than 1 workflows.  */
-// !!!!!! Do not remove this check. !!!!!!
 if (Object.keys(mastra.getWorkflows()).length > 1) {
   throw new Error(
     "More than 1 workflows found. Currently, more than 1 workflows are not supported in the UI, since doing so will cause app state to be inconsistent.",
   );
 }
 
-/*  Sanity check 2: Throw an error if there are more than 1 agents.  */
-// !!!!!! Do not remove this check. !!!!!!
 if (Object.keys(mastra.getAgents()).length > 1) {
   throw new Error(
     "More than 1 agents found. Currently, more than 1 agents are not supported in the UI, since doing so will cause app state to be inconsistent.",
