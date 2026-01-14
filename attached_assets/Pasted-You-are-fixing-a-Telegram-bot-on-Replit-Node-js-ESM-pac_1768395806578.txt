@@ -1,0 +1,71 @@
+You are fixing a Telegram bot on Replit (Node.js, ESM: package.json has "type":"module"). 
+The bot is currently NOT responding in Telegram. Fix it now. No explanations, just implement.
+
+NON-NEGOTIABLE REQUIREMENTS:
+1) Bot MUST respond to /ping with "pong ✅" under ALL circumstances.
+2) Use polling only. DO NOT use webhooks.
+3) Do NOT allow DB or OpenAI failures to stop the bot.
+4) Keep ESM (NO require()).
+5) Ensure ONLY ONE polling instance runs (handle 409 Conflict gracefully).
+6) Add hard logging so we can see it is alive (heartbeat).
+
+DELIVERABLES:
+- A single entry file named: "index.js" (ESM) that is guaranteed to run on Replit.
+- package.json scripts updated so "npm start" runs the bot reliably on Replit.
+- A minimal, reliable bot core FIRST; other features optional and must be guarded.
+
+IMPLEMENTATION PLAN (DO IT EXACTLY):
+
+A) Make sure runtime can execute node:
+- Use the script "start": "node index.js"
+- If node isn't in PATH, use "start": "npx node index.js"
+Pick the one that works in Replit environment.
+
+B) Implement a "Minimal Always-On Bot" FIRST (must not depend on anything):
+- Read TELEGRAM_BOT_TOKEN only (mandatory).
+- If missing: print clear error and exit.
+- Create Telegraf bot.
+- Commands:
+  /start -> "✅ bot online"
+  /ping  -> "pong ✅"
+  /health -> returns JSON-like text:
+     running: yes
+     token: present
+     db: enabled/disabled
+     openai: enabled/disabled
+     last_error: <value>
+- Add fallback text handler: reply "received ✅" for any text.
+
+C) Add bulletproof error handling:
+- bot.catch(...) logs full stack
+- process.on("unhandledRejection"...)
+- process.on("uncaughtException"...)
+- Maintain global variable LAST_ERROR updated on any error and shown in /health
+
+D) Add heartbeat logger:
+- Every 30 seconds console.log("HEARTBEAT: bot alive", new Date().toISOString())
+
+E) Handle Telegram polling conflicts:
+- On bot.launch(), catch errors.
+- If error message/code indicates 409 Conflict (another getUpdates instance):
+   - log "Conflict: another instance is polling. STOP other instances and restart this repl."
+   - Do NOT crash loop silently. Retry launch after 15 seconds.
+- If 401 Unauthorized:
+   - log "Unauthorized: TELEGRAM_BOT_TOKEN is wrong."
+   - Stop execution.
+
+F) Optional components (must NOT block bot):
+- Initialize DATABASE_URL and OPENAI_API_KEY only if present.
+- Wrap in try/catch.
+- If DB fails: set dbEnabled=false and keep bot running.
+- If OpenAI fails: set openaiEnabled=false and keep bot running.
+- Never throw during startup due to DB/OpenAI.
+
+G) Deployment reliability:
+- Ensure bot.launch() is called once.
+- Add graceful stop handlers SIGINT/SIGTERM.
+
+FINISH:
+- After implementing, print to console:
+  "BOT READY. Test in Telegram: /ping"
+- Do NOT ask me questions. Do not propose alternatives. Implement now.
