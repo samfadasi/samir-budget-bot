@@ -77,3 +77,8 @@ outputType = "automations"
 
 [userenv.production]
 PORT = "5000"
+
+[userenv.shared]
+ENABLE_SMART_ALERTS = "true"
+ENABLE_PDF_REPORTS = "true"
+ENABLE_DASHBOARD = "false"

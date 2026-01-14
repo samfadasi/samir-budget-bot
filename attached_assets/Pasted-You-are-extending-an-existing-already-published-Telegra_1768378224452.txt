@@ -1,0 +1,132 @@
+You are extending an existing, already-published Telegram AI accounting bot running on Replit.
+
+IMPORTANT RULES:
+- Do NOT break or disable existing Telegram bot functionality.
+- Do NOT remove polling mode.
+- All new features must be backward-compatible.
+- Use feature flags so any feature can be turned ON/OFF without redeploy.
+- Existing users and data must remain intact.
+
+Environment variables already exist:
+- TELEGRAM_BOT_TOKEN
+- OPENAI_API_KEY
+- DATABASE_URL
+
+You may add:
+- ENABLE_DASHBOARD
+- ENABLE_PDF_REPORTS
+- ENABLE_SMART_ALERTS
+
+==================================================
+NEW FEATURES TO ADD
+==================================================
+
+1) Budget Management (HIGH PRIORITY – LOW RISK)
+- Add monthly budgets per category per user
+- Track:
+  - total spent
+  - remaining amount
+  - percentage used
+- Trigger Telegram alerts:
+  - at 80% of budget
+  - at 100% of budget
+- Alerts must be sent only once per threshold
+- Must work automatically after each transaction
+- Must not slow down message processing
+
+==================================================
+
+2) Smart Alerts (AI-BASED)
+(Guarded by ENABLE_SMART_ALERTS flag)
+
+- Detect abnormal spending patterns:
+  - Amount much higher than user’s historical average
+  - New vendor with unusually high value
+  - Sudden spike in daily spending
+- Use OpenAI Responses API for reasoning
+- Alerts must be explainable, short, and actionable
+- Send alerts via Telegram only
+
+==================================================
+
+3) PDF & CSV Reports
+(Guarded by ENABLE_PDF_REPORTS flag)
+
+- Generate reports on demand via Telegram commands:
+  /report daily
+  /report weekly
+  /report monthly
+  /export pdf
+  /export csv
+- Reports must include:
+  - Total spending
+  - Category breakdown
+  - Budget vs actual
+  - Top vendors
+- PDFs must be clean, readable, and professional
+- PDF generation must run in a separate function/process
+- Failure to generate PDF must NOT affect bot availability
+
+==================================================
+
+4) Web Dashboard (OPTIONAL, SAFE MODE)
+(Guarded by ENABLE_DASHBOARD flag)
+
+- Add a lightweight web dashboard using FastAPI
+- Must NOT interfere with Telegram bot
+- Authentication:
+  - Telegram login OR
+  - One-time secure token per user
+- Dashboard pages:
+  - Overview (KPIs, totals, charts)
+  - Transactions (filter/search)
+  - Budgets (edit monthly budgets)
+  - Reports (download PDF/CSV)
+- If dashboard is disabled, bot must continue working normally
+
+==================================================
+
+5) Database Changes (SAFE MIGRATIONS ONLY)
+
+Add new tables if missing:
+- budgets
+- alerts_log
+- reports_log
+
+Rules:
+- Use idempotent migrations (CREATE TABLE IF NOT EXISTS)
+- Do NOT alter or drop existing tables
+- Do NOT delete user data
+
+==================================================
+
+6) Architecture & Stability
+
+- Keep polling-based Telegram bot running at all times
+- All new logic must be modular
+- Any failure in dashboard / PDF / alerts must be isolated
+- Logging required for:
+  - alerts triggered
+  - report generation
+  - errors (without crashing the bot)
+
+==================================================
+
+7) Final Requirements
+
+- Production-ready code
+- Clean structure
+- Clear separation between:
+  Telegram Bot
+  AI Logic
+  Budget Engine
+  Reporting Engine
+  Dashboard (optional)
+- Must work immediately after deployment
+- No manual steps required from the user after deployment
+
+==================================================
+
+This is a real finance system upgrade.
+Stability is more important than features.
+Do NOT implement anything experimental or unsafe.
