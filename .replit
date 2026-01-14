@@ -18,20 +18,8 @@ run = ["sh", "-c", "cd .mastra/output && NODE_ENV=production node index.mjs"]
 deploymentTarget = "cloudrun"
 
 [[ports]]
-localPort = 3000
-externalPort = 3000
-exposeLocalhost = true
-
-[[ports]]
 localPort = 5000
 externalPort = 80
-
-[[ports]]
-localPort = 6000
-externalPort = 6000
-
-[[ports]]
-localPort = 8289
 
 [workflows]
 runButton = "Project"
