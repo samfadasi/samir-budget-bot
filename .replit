@@ -14,7 +14,7 @@ MASTRA_HIDE_CLOUD_CTA = "true"
 
 [deployment]
 build = ["bash", "scripts/build.sh"]
-run = ["sh", "-c", "cd .mastra/output && NODE_ENV=production node index.mjs"]
+run = ["bash", "scripts/start-production.sh"]
 deploymentTarget = "cloudrun"
 
 [[ports]]
