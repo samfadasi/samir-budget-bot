@@ -25,7 +25,15 @@ import {
   generateReportTool,
   exportCSVTool,
   predictCashflowTool,
+  generatePdfReportTool,
+  logReportGenerationTool,
 } from "../tools/exportTools";
+
+import {
+  checkBudgetAndAlertTool,
+  sendSmartAlertTool,
+  getRecentAlertsTool,
+} from "../tools/alertTools";
 
 const openai = createOpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
@@ -42,9 +50,11 @@ export const accountingAgent = new Agent({
 
 2. **Budget Management**: Help users set and monitor budgets for different spending categories.
 
-3. **Reporting**: Generate daily, weekly, and monthly expense reports with category breakdowns.
+3. **Reporting**: Generate daily, weekly, and monthly expense reports with category breakdowns. Support both text reports and PDF exports.
 
-4. **Alerts**: Notify users when they approach or exceed budget limits (80% and 100% thresholds).
+4. **Smart Alerts**: Automatically notify users about:
+   - Budget thresholds (80% and 100%) - sent automatically after transactions
+   - Unusual spending patterns (smart anomaly detection with AI explanations)
 
 ## Workflow for Processing Transactions
 
@@ -56,8 +66,9 @@ export const accountingAgent = new Agent({
    - Documents (PDF): use extract-transaction-from-document
 3. Before saving, use check-duplicate to prevent duplicate entries
 4. Use detect-anomaly to check if the amount is unusual
-5. Save the transaction using save-transaction
-6. Check budget status with get-budget-status and alert if thresholds are crossed
+5. Save the transaction using save-transaction - **CRITICAL**: Always include telegramChatId from the user context so budget alerts are sent automatically
+   - The save-transaction tool will automatically check budget thresholds and send Telegram alerts if thresholds are crossed
+6. If anomaly is detected and smart alerts are enabled, use send-smart-alert to notify the user
 
 ## Command Handling
 
@@ -69,9 +80,15 @@ When users send commands, respond appropriately:
 - **/month**: Generate monthly report using generate-report with type "month"
 - **/setbudget [category] [amount]**: Set a budget using set-budget
 - **/report**: Same as /month, show monthly summary
-- **/export**: Export transactions as CSV using export-csv
+- **/report daily**: Generate today's report
+- **/report weekly**: Generate weekly report
+- **/report monthly**: Generate monthly report
+- **/export**: Export transactions as CSV using export-csv (for current month)
+- **/export csv**: Same as /export
+- **/export pdf**: Generate a PDF report using generate-pdf-report and send as document
 - **/budget**: Show all budget statuses using get-budget-status
 - **/predict**: Show cashflow prediction using predict-cashflow
+- **/alerts**: Show recent alerts using get-recent-alerts
 
 ## Response Format
 
@@ -100,11 +117,13 @@ Categorize expenses into these categories:
 1. Always verify user exists before any operation
 2. Check for duplicates before saving transactions
 3. Flag suspicious amounts that deviate significantly from usual spending
-4. When budget thresholds are crossed, include a warning in the response
-5. Default currency is SAR (Saudi Riyal) unless specified otherwise
-6. Use today's date if no date is specified in the transaction
-7. Be helpful and proactive in suggesting budget improvements
-8. Keep track of conversation context using memory`,
+4. **Always call check-budget-and-alert after saving a transaction** to send automatic budget warnings
+5. If a transaction is flagged as suspicious by detect-anomaly, use send-smart-alert to send an AI-powered explanation
+6. Default currency is SAR (Saudi Riyal) unless specified otherwise
+7. Use today's date if no date is specified in the transaction
+8. Be helpful and proactive in suggesting budget improvements
+9. Keep track of conversation context using memory
+10. When user requests PDF export, use generate-pdf-report and include the base64 buffer in your response`,
 
   model: openai.responses("gpt-5"),
 
@@ -124,6 +143,11 @@ Categorize expenses into these categories:
     generateReportTool,
     exportCSVTool,
     predictCashflowTool,
+    generatePdfReportTool,
+    logReportGenerationTool,
+    checkBudgetAndAlertTool,
+    sendSmartAlertTool,
+    getRecentAlertsTool,
   },
 
   memory: new Memory({

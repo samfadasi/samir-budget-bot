@@ -30,6 +30,9 @@ const processWithAgentStep = createStep({
     hasCSVExport: z.boolean(),
     csvContent: z.string().optional(),
     csvFileName: z.string().optional(),
+    hasPDFExport: z.boolean(),
+    pdfBuffer: z.string().optional(),
+    pdfFileName: z.string().optional(),
   }),
   execute: async ({ inputData, mastra }) => {
     const logger = mastra?.getLogger();
@@ -109,6 +112,9 @@ The user sent an unsupported message type. Let them know you can process text me
       let hasCSVExport = false;
       let csvContent: string | undefined;
       let csvFileName: string | undefined;
+      let hasPDFExport = false;
+      let pdfBuffer: string | undefined;
+      let pdfFileName: string | undefined;
 
       if (response.toolResults) {
         for (const result of Object.values(response.toolResults) as any[]) {
@@ -116,7 +122,11 @@ The user sent an unsupported message type. Let them know you can process text me
             hasCSVExport = true;
             csvContent = result.csvContent;
             csvFileName = result.fileName || "transactions.csv";
-            break;
+          }
+          if (result?.pdfBuffer && result?.success) {
+            hasPDFExport = true;
+            pdfBuffer = result.pdfBuffer;
+            pdfFileName = result.fileName || "report.pdf";
           }
         }
       }
@@ -127,6 +137,9 @@ The user sent an unsupported message type. Let them know you can process text me
         hasCSVExport,
         csvContent,
         csvFileName,
+        hasPDFExport,
+        pdfBuffer,
+        pdfFileName,
       };
     } catch (error) {
       logger?.error("❌ [Step 1] Agent processing failed", { error });
@@ -134,6 +147,7 @@ The user sent an unsupported message type. Let them know you can process text me
         agentResponse: "Sorry, I encountered an error processing your request. Please try again.",
         chatId: inputData.chatId,
         hasCSVExport: false,
+        hasPDFExport: false,
       };
     }
   },
@@ -148,6 +162,9 @@ const sendToTelegramStep = createStep({
     hasCSVExport: z.boolean(),
     csvContent: z.string().optional(),
     csvFileName: z.string().optional(),
+    hasPDFExport: z.boolean(),
+    pdfBuffer: z.string().optional(),
+    pdfFileName: z.string().optional(),
   }),
   outputSchema: z.object({
     success: z.boolean(),
@@ -192,6 +209,18 @@ const sendToTelegramStep = createStep({
           csvBuffer,
           inputData.csvFileName,
           "📊 Here's your transaction export"
+        );
+      }
+
+      if (inputData.hasPDFExport && inputData.pdfBuffer && inputData.pdfFileName) {
+        logger?.info("📄 [Step 2] Sending PDF report", { fileName: inputData.pdfFileName });
+        
+        const pdfBufferData = Buffer.from(inputData.pdfBuffer, "base64");
+        await sendTelegramDocument(
+          inputData.chatId,
+          pdfBufferData,
+          inputData.pdfFileName,
+          "📄 Here's your PDF expense report"
         );
       }
 

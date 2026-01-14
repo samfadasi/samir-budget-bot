@@ -12,6 +12,7 @@ import { inngest, inngestServe } from "./inngest";
 import { accountingAgent } from "./agents/accountingAgent";
 import { accountingWorkflow } from "./workflows/accountingWorkflow";
 import { registerTelegramTrigger } from "../triggers/telegramTriggers";
+import { createDashboardRoutes } from "../dashboard";
 
 class ProductionPinoLogger extends MastraLogger {
   protected logger: pino.Logger;
@@ -66,6 +67,7 @@ export const mastra = new Mastra({
       "hono",
       "hono/streaming",
       "pg",
+      "pdfkit",
     ],
     sourcemap: true,
   },
@@ -102,6 +104,21 @@ export const mastra = new Mastra({
         path: "/api/inngest",
         method: "ALL",
         createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }),
+      },
+      {
+        path: "/dashboard/*",
+        method: "ALL",
+        createHandler: async () => {
+          const dashboardApp = createDashboardRoutes();
+          return async (c: any) => {
+            const path = c.req.path.replace("/dashboard", "") || "/";
+            const newRequest = new Request(
+              new URL(path, c.req.url),
+              c.req.raw
+            );
+            return dashboardApp.fetch(newRequest, c.env);
+          };
+        },
       },
       ...registerTelegramTrigger({
         triggerType: "telegram/message",

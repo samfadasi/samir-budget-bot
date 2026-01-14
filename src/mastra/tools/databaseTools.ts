@@ -1,12 +1,131 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import pg from "pg";
+import { sendTelegramMessage } from "../../triggers/telegramTriggers";
 
 const { Pool } = pg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+
+async function checkAndSendBudgetAlerts(
+  client: pg.PoolClient,
+  userId: number,
+  category: string,
+  telegramChatId: number | undefined,
+  logger?: any
+): Promise<{ alertsSent: Array<{ threshold: number; message: string }> }> {
+  const alertsSent: Array<{ threshold: number; message: string }> = [];
+  
+  if (!telegramChatId) {
+    logger?.info("⏭️ [checkBudgetAlerts] No chat ID provided, skipping alerts");
+    return { alertsSent };
+  }
+
+  const yearMonth = new Date().toISOString().substring(0, 7);
+  const [year, month] = yearMonth.split("-");
+  const startDate = `${yearMonth}-01`;
+  const endDate = new Date(parseInt(year), parseInt(month), 0).toISOString().split("T")[0];
+
+  const budgetResult = await client.query(
+    `SELECT id, monthly_limit::float as limit 
+     FROM budgets 
+     WHERE user_id = $1 AND category = $2 AND year_month = $3`,
+    [userId, category, yearMonth]
+  );
+
+  if (budgetResult.rows.length === 0) {
+    logger?.info("⏭️ [checkBudgetAlerts] No budget set for category", { category });
+    return { alertsSent };
+  }
+
+  const budget = budgetResult.rows[0];
+  
+  const spentResult = await client.query(
+    `SELECT COALESCE(SUM(amount), 0)::float as spent 
+     FROM transactions 
+     WHERE user_id = $1 AND category = $2 AND date >= $3 AND date <= $4`,
+    [userId, category, startDate, endDate]
+  );
+
+  const spent = spentResult.rows[0].spent;
+  const limit = budget.limit;
+  const percentUsed = limit > 0 ? Math.round((spent / limit) * 100) : 0;
+
+  logger?.info("📊 [checkBudgetAlerts] Budget status", {
+    category,
+    spent,
+    limit,
+    percentUsed,
+  });
+
+  const thresholds = [
+    { 
+      threshold: 100, 
+      alertType: "BUDGET_100",
+      message: `🚨 <b>Budget Exceeded!</b>\n\nYou've spent ${spent.toFixed(2)} SAR on <b>${category}</b>, which is ${percentUsed}% of your ${limit.toFixed(2)} SAR budget.\n\nConsider reviewing your spending in this category.` 
+    },
+    { 
+      threshold: 80, 
+      alertType: "BUDGET_80",
+      message: `⚠️ <b>Budget Warning</b>\n\nYou've reached ${percentUsed}% of your <b>${category}</b> budget.\n\nSpent: ${spent.toFixed(2)} SAR\nLimit: ${limit.toFixed(2)} SAR\nRemaining: ${Math.max(0, limit - spent).toFixed(2)} SAR` 
+    },
+  ];
+
+  for (const check of thresholds) {
+    if (percentUsed >= check.threshold) {
+      const existingAlert = await client.query(
+        `SELECT id FROM alerts_log 
+         WHERE user_id = $1 AND category = $2 AND year_month = $3 AND threshold_percent = $4`,
+        [userId, category, yearMonth, check.threshold]
+      );
+
+      if (existingAlert.rows.length === 0) {
+        logger?.info("🔔 [checkBudgetAlerts] Sending threshold alert", {
+          category,
+          threshold: check.threshold,
+          percentUsed,
+        });
+
+        await client.query(
+          `INSERT INTO alerts_log 
+           (user_id, alert_type, category, budget_id, year_month, threshold_percent, 
+            amount_spent, budget_limit, message, telegram_sent)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            userId,
+            check.alertType,
+            category,
+            budget.id,
+            yearMonth,
+            check.threshold,
+            spent,
+            limit,
+            check.message,
+            true,
+          ]
+        );
+
+        const sent = await sendTelegramMessage(telegramChatId, check.message, "HTML");
+        
+        if (sent) {
+          alertsSent.push({
+            threshold: check.threshold,
+            message: check.message,
+          });
+          logger?.info("✅ [checkBudgetAlerts] Alert sent to Telegram", { threshold: check.threshold });
+        }
+
+        break;
+      } else {
+        logger?.info("⏭️ [checkBudgetAlerts] Alert already sent for threshold", { threshold: check.threshold });
+      }
+    }
+  }
+
+  return { alertsSent };
+}
 
 const CategoryEnum = z.enum([
   "Food",
@@ -89,9 +208,10 @@ export const getOrCreateUserTool = createTool({
 export const saveTransactionTool = createTool({
   id: "save-transaction",
   description:
-    "Saves a new financial transaction to the database. Use this after extracting transaction details from user input.",
+    "Saves a new financial transaction to the database and automatically checks budget thresholds. Use this after extracting transaction details from user input. IMPORTANT: Always provide telegramChatId to enable automatic budget alerts.",
   inputSchema: z.object({
     userId: z.number().describe("Internal user ID from the database"),
+    telegramChatId: z.number().optional().describe("Telegram chat ID for sending budget alerts - REQUIRED for automatic budget notifications"),
     date: z.string().describe("Transaction date in YYYY-MM-DD format"),
     amount: z.number().describe("Transaction amount"),
     currency: z.string().default("SAR").describe("Currency code"),
@@ -111,6 +231,8 @@ export const saveTransactionTool = createTool({
     transactionId: z.number(),
     saved: z.boolean(),
     message: z.string(),
+    budgetAlertSent: z.boolean(),
+    budgetAlertMessage: z.string().optional(),
   }),
   execute: async ({ context, mastra }) => {
     const logger = mastra?.getLogger();
@@ -207,10 +329,23 @@ export const saveTransactionTool = createTool({
         transactionId: result.rows[0].id,
       });
 
+      const { alertsSent } = await checkAndSendBudgetAlerts(
+        client,
+        context.userId,
+        context.category,
+        context.telegramChatId,
+        logger
+      );
+
+      const budgetAlertSent = alertsSent.length > 0;
+      const budgetAlertMessage = alertsSent.length > 0 ? alertsSent[0].message : undefined;
+
       return {
         transactionId: result.rows[0].id,
         saved: true,
         message: `Transaction saved: ${context.amount} ${context.currency} for ${context.category}`,
+        budgetAlertSent,
+        budgetAlertMessage,
       };
     } finally {
       client.release();
