@@ -246,9 +246,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function getPublicUrl(): Promise<string | null> {
-  const replitUrl = process.env.REPLIT_DEV_DOMAIN;
-  if (replitUrl) {
-    return `https://${replitUrl}`;
+  if (process.env.REPLIT_DEPLOYMENT_URL) {
+    return process.env.REPLIT_DEPLOYMENT_URL;
+  }
+  
+  if (process.env.REPLIT_DEV_DOMAIN) {
+    return `https://${process.env.REPLIT_DEV_DOMAIN}`;
   }
   
   const replitSlug = process.env.REPL_SLUG;

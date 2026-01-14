@@ -2,5 +2,6 @@
 
 set -e
 
-echo "🤖 Starting minimal polling bot..."
-exec node index.js
+echo "🤖 Starting unified bot server (dev mode)..."
+export PORT=3000
+exec npx tsx src/server.ts
