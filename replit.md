@@ -132,6 +132,21 @@ src/triggers/           - Webhook and cron trigger handlers
 ## Known Issues & Deployment Notes
 
 ### Production Deployment
-- The bot is configured with webhook URL: `https://aibudget-bot.replit.app/webhooks/telegram/action`
-- After code changes, redeploy to see changes reflected in the Telegram bot
-- Use `mastra build` to create production bundle in `.mastra/output/`
+- **IMPORTANT**: Bot now uses **polling mode** instead of webhooks for better reliability
+- Polling bot runs via `src/bot.ts` and starts automatically with the Inngest workflow
+- For production: Use `scripts/start-production.sh` which runs both the bot and Mastra API
+- Build command: `scripts/build.sh` (builds both Mastra and the polling bot)
+- Development: Bot starts automatically via `scripts/inngest.sh`
+
+### Recent Fix (2026-01-14): Switched from Webhooks to Polling
+- **Issue**: Replit dev server URL wasn't accessible externally for Telegram webhooks
+- **Root Cause**: Port 5000 didn't have `exposeLocalhost = true` in .replit
+- **Solution**: Created standalone polling bot (`src/bot.ts`) that uses Telegraf polling mode
+- **Result**: Bot now works reliably in development without external URL requirements
+
+### Bot Commands
+- `/ping` - Connection test (responds "pong ✅")
+- `/health` - System status (DB, OpenAI, errors)
+- `/start` - Welcome message
+- `/help` - Available commands
+- `/balance` - Current balance
