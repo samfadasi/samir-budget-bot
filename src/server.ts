@@ -77,10 +77,11 @@ if (databaseUrl) {
   log('warn', 'Database disabled (DATABASE_URL not set)');
 }
 
-const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
-if (!process.env.TELEGRAM_WEBHOOK_SECRET && isProduction) {
-  log('warn', 'TELEGRAM_WEBHOOK_SECRET not set, generated random secret');
-  log('info', `Add to secrets: TELEGRAM_WEBHOOK_SECRET=${webhookSecret}`);
+const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET && process.env.TELEGRAM_WEBHOOK_SECRET.length < 100 
+  ? process.env.TELEGRAM_WEBHOOK_SECRET 
+  : crypto.randomBytes(32).toString('hex');
+if (!process.env.TELEGRAM_WEBHOOK_SECRET || process.env.TELEGRAM_WEBHOOK_SECRET.length >= 100) {
+  log('warn', 'TELEGRAM_WEBHOOK_SECRET not set or invalid, using generated secret');
 }
 
 const bot = new Telegraf(token);
@@ -221,7 +222,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  if (req.method === 'POST' && url.pathname === `/telegram/${webhookSecret}`) {
+  if (req.method === 'POST' && url.pathname === '/telegram/webhook') {
+    const secretHeader = req.headers['x-telegram-bot-api-secret-token'];
+    if (secretHeader !== webhookSecret) {
+      log('warn', 'Invalid webhook secret token');
+      res.writeHead(401);
+      res.end('Unauthorized');
+      return;
+    }
+    
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
@@ -234,8 +243,8 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         const error = err as Error;
         log('error', `Webhook error: ${error.message}`);
-        res.writeHead(500);
-        res.end('error');
+        res.writeHead(200);
+        res.end('ok');
       }
     });
     return;
@@ -271,9 +280,9 @@ async function startBot() {
     if (isProduction) {
       const publicUrl = await getPublicUrl();
       if (publicUrl) {
-        const webhookUrl = `${publicUrl}/telegram/${webhookSecret}`;
-        log('info', `Setting webhook: ${webhookUrl.replace(webhookSecret, '***')}`);
-        await bot.telegram.setWebhook(webhookUrl);
+        const webhookUrl = `${publicUrl}/telegram/webhook`;
+        log('info', `Setting webhook: ${webhookUrl}`);
+        await bot.telegram.setWebhook(webhookUrl, { secret_token: webhookSecret });
         health.mode = 'webhook';
         log('info', 'Webhook mode activated');
         health.botRunning = true;
