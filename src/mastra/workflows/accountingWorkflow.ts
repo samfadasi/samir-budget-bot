@@ -166,16 +166,17 @@ const sendToTelegramStep = createStep({
       let responseText = inputData.agentResponse;
       
       if (responseText.length > MAX_MESSAGE_LENGTH) {
-        responseText = responseText.substring(0, MAX_MESSAGE_LENGTH) + "\n\n<i>[Message truncated due to length]</i>";
+        responseText = responseText.substring(0, MAX_MESSAGE_LENGTH) + "\n\n[Message truncated due to length]";
       }
 
-      const messageSent = await sendTelegramMessage(inputData.chatId, responseText, "HTML");
+      const messageSent = await sendTelegramMessage(inputData.chatId, responseText, null);
 
       if (!messageSent) {
+        logger?.warn("⚠️ [Step 2] First send failed, retrying with plain text");
         const plainSent = await sendTelegramMessage(
           inputData.chatId,
-          responseText.replace(/<[^>]*>/g, ""),
-          "HTML"
+          responseText.replace(/<[^>]*>/g, "").replace(/\*\*/g, "").replace(/\*/g, ""),
+          null
         );
         if (!plainSent) {
           throw new Error("Failed to send message to Telegram");

@@ -141,6 +141,8 @@ export const saveTransactionTool = createTool({
         }
       }
 
+      const duplicateOfValue = context.duplicateOfId && context.duplicateOfId > 0 ? context.duplicateOfId : null;
+      
       const result = await client.query(
         `INSERT INTO transactions 
          (user_id, vendor_id, date, amount, currency, category, description, 
@@ -158,7 +160,7 @@ export const saveTransactionTool = createTool({
           context.sourceType,
           context.rawInput || null,
           context.isDuplicate,
-          context.duplicateOfId || null,
+          duplicateOfValue,
           context.isSuspicious,
           context.suspiciousReason || null,
         ]
