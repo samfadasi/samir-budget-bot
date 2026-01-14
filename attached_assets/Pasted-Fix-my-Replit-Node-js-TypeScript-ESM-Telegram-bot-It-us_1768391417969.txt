@@ -1,0 +1,70 @@
+Fix my Replit Node.js/TypeScript (ESM) Telegram bot. It used to reply “Bot is working on Replit (ESM)” but now it does not respond in Telegram.
+
+GOAL:
+Make the bot respond reliably again, without breaking the existing project.
+
+STRICT REQUIREMENTS:
+- Keep ESM (package.json has "type": "module"). Do NOT use require().
+- Keep polling mode (do NOT use webhooks).
+- The bot must always start even if DB or OpenAI is misconfigured.
+- Add strong diagnostics and logging.
+- Make /ping command work no matter what (even if DB/OpenAI fail).
+- Do NOT remove existing features; isolate failures so bot remains responsive.
+
+STEP-BY-STEP TASKS:
+
+1) Runtime verification
+- Ensure the Replit run command starts the bot file correctly.
+- Confirm node is executed correctly in this environment (if node isn’t in PATH use npx node).
+- Ensure the process stays alive (no immediate exit).
+
+2) Add global error handlers
+Add:
+- bot.catch()
+- process.on('unhandledRejection')
+- process.on('uncaughtException')
+Log full errors to console.
+
+3) Add a minimum always-on handler
+- Implement /ping that replies "pong ✅"
+- Implement a plain text echo fallback (e.g., “received”) to confirm updates are being processed.
+
+4) Environment variable validation (NON-FATAL)
+- TELEGRAM_BOT_TOKEN is mandatory -> if missing, log error and exit with clear message.
+- OPENAI_API_KEY and DATABASE_URL must be OPTIONAL:
+  - If missing, log "OpenAI disabled" or "DB disabled"
+  - Bot must still reply to /start and /ping even when missing.
+
+5) Telegraf launch stability
+- Launch bot with proper options
+- Print “Bot started (polling)” when running
+- Print bot username via getMe() on startup
+- Handle common errors explicitly:
+  - 401 Unauthorized (bad token)
+  - 409 Conflict (another polling instance running)
+Explain in console what to do for each.
+
+6) DB and OpenAI isolation
+- Wrap DB init and OpenAI init in try/catch
+- If DB connection fails, disable DB features but keep bot alive
+- If OpenAI fails, disable AI extraction but keep bot alive
+- Any command depending on DB/OpenAI must reply with a helpful message instead of hanging/crashing.
+
+7) Smoke test mode
+- Add a /health command that returns:
+  - bot running: yes
+  - db connected: yes/no
+  - openai enabled: yes/no
+  - last error: <if any>
+
+DELIVERABLES:
+- Update the code so bot responds again
+- Update package.json scripts / Replit run command if needed
+- Provide a short checklist in comments at top of the main file:
+  1) set TELEGRAM_BOT_TOKEN
+  2) run
+  3) test /ping
+  4) check console
+
+IMPORTANT:
+Do NOT ask me questions. Implement and fix directly.
