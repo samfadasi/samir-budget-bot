@@ -4,6 +4,12 @@ set -e
 
 INNGEST_CONFIG=".config/inngest/inngest.yaml"
 
+# Start Telegram polling bot in background
+echo "🤖 Starting Telegram polling bot..."
+npx tsx src/bot.ts &
+BOT_PID=$!
+echo "✅ Bot started with PID: $BOT_PID"
+
 # Try to store Inngest data in Postgres if it's available. Otherwise, put it in SQLite.
 if [[ ! -f  "${INNGEST_CONFIG}" ]]; then
     mkdir -p "$(dirname "${INNGEST_CONFIG}")"
