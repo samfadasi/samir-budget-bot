@@ -122,46 +122,60 @@ export const saveTransactionTool = createTool({
 
     const client = await pool.connect();
     try {
-      let vendorId = null;
+      let vendorId: number | null = null;
       if (context.vendorName) {
+        logger?.info("💾 [saveTransaction] Looking up vendor", {
+          vendorName: context.vendorName,
+        });
         const existingVendor = await client.query(
-          "SELECT id FROM vendors WHERE user_id = $1 AND LOWER(name) = LOWER($2)",
-          [context.userId, context.vendorName]
+          "SELECT id FROM vendors WHERE user_id = $1::integer AND LOWER(name) = LOWER($2::text)",
+          [Number(context.userId), String(context.vendorName)]
         );
 
         if (existingVendor.rows.length > 0) {
-          vendorId = existingVendor.rows[0].id;
+          vendorId = Number(existingVendor.rows[0].id);
+          logger?.info("💾 [saveTransaction] Found existing vendor", { vendorId });
         } else {
+          logger?.info("💾 [saveTransaction] Creating new vendor");
           const newVendor = await client.query(
             `INSERT INTO vendors (user_id, name, normalized_name) 
-             VALUES ($1, $2, LOWER($2)) RETURNING id`,
-            [context.userId, context.vendorName]
+             VALUES ($1::integer, $2::text, LOWER($2::text)) RETURNING id`,
+            [Number(context.userId), String(context.vendorName)]
           );
-          vendorId = newVendor.rows[0].id;
+          vendorId = Number(newVendor.rows[0].id);
+          logger?.info("💾 [saveTransaction] Created new vendor", { vendorId });
         }
       }
 
-      const duplicateOfValue = context.duplicateOfId && context.duplicateOfId > 0 ? context.duplicateOfId : null;
+      const duplicateOfValue = context.isDuplicate && context.duplicateOfId && context.duplicateOfId > 0 ? Number(context.duplicateOfId) : null;
+      
+      logger?.info("💾 [saveTransaction] Inserting with params", {
+        vendorId,
+        vendorIdType: typeof vendorId,
+        duplicateOfValue,
+        duplicateOfValueType: typeof duplicateOfValue,
+      });
       
       const result = await client.query(
         `INSERT INTO transactions 
          (user_id, vendor_id, date, amount, currency, category, description, 
           source_type, raw_input, is_duplicate, duplicate_of, is_suspicious, suspicious_reason) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) 
+         VALUES ($1::integer, $2::integer, $3::date, $4::numeric, $5::text, $6::text, $7::text, 
+                 $8::text, $9::text, $10::boolean, $11::integer, $12::boolean, $13::text) 
          RETURNING id`,
         [
-          context.userId,
+          Number(context.userId),
           vendorId,
           context.date,
-          context.amount,
+          Number(context.amount),
           context.currency,
           context.category,
           context.description,
           context.sourceType,
           context.rawInput || null,
-          context.isDuplicate,
+          Boolean(context.isDuplicate),
           duplicateOfValue,
-          context.isSuspicious,
+          Boolean(context.isSuspicious),
           context.suspiciousReason || null,
         ]
       );

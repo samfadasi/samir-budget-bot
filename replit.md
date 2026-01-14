@@ -76,3 +76,18 @@ src/triggers/           - Webhook and cron trigger handlers
 - **Pino** (`pino`, `@mastra/loggers`): Structured logging
 - **dotenv**: Environment variable management
 - **p-limit**, **p-retry**: Concurrency and retry utilities
+
+## Recent Changes
+
+### 2026-01-14: Fixed saveTransaction PostgreSQL Type Inference Bug
+- **Issue**: PostgreSQL prepared statement caching caused "inconsistent types deduced for parameter $2" errors when vendor_id and duplicate_of_id parameters alternated between null and integer values
+- **Root Cause**: Neon PostgreSQL backend uses prepared statement pooling which infers types from first usage; subsequent calls with different types (null vs number) caused type conflicts
+- **Fix**: Added explicit SQL type casts (::integer, ::text, ::date, ::numeric, ::boolean) to all INSERT parameters in `src/mastra/tools/databaseTools.ts`
+- **Pattern**: When working with nullable integer columns in PostgreSQL pooled connections, always use explicit type casts to prevent type inference issues
+
+## Known Issues & Deployment Notes
+
+### Production Deployment
+- The bot is configured with webhook URL: `https://aibudget-bot.replit.app/webhooks/telegram/action`
+- After code changes, redeploy to see changes reflected in the Telegram bot
+- Use `mastra build` to create production bundle in `.mastra/output/`
