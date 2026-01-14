@@ -131,22 +131,35 @@ src/triggers/           - Webhook and cron trigger handlers
 
 ## Known Issues & Deployment Notes
 
-### Production Deployment
-- **IMPORTANT**: Bot now uses **polling mode** instead of webhooks for better reliability
-- Polling bot runs via `src/bot.ts` and starts automatically with the Inngest workflow
-- For production: Use `scripts/start-production.sh` which runs both the bot and Mastra API
-- Build command: `scripts/build.sh` (builds both Mastra and the polling bot)
-- Development: Bot starts automatically via `scripts/inngest.sh`
+### Unified Bot Architecture (Updated 2026-01-14)
+The bot now uses a unified server (`src/server.ts`) that runs both an HTTP server and the Telegram bot:
+- **Development**: HTTP server on port 3000 + polling mode for Telegram
+- **Production**: HTTP server on PORT (for Replit health checks) + webhook mode for Telegram
 
-### Recent Fix (2026-01-14): Switched from Webhooks to Polling
-- **Issue**: Replit dev server URL wasn't accessible externally for Telegram webhooks
-- **Root Cause**: Port 5000 didn't have `exposeLocalhost = true` in .replit
-- **Solution**: Created standalone polling bot (`src/bot.ts`) that uses Telegraf polling mode
-- **Result**: Bot now works reliably in development without external URL requirements
+### Bot Server Endpoints
+- `GET /health` - Returns JSON health status (bot, db, openai, mode, uptime)
+- `GET /ping` - Returns "pong" for simple connectivity test
+- `POST /telegram/<secret>` - Webhook endpoint for Telegram updates (production only)
+
+### Environment Variables
+- `NODE_ENV=production` or `REPLIT_DEPLOYMENT=1` - Triggers production mode
+- `PORT` - HTTP server port (default: 3000 in dev, from Replit in prod)
+- `TELEGRAM_WEBHOOK_SECRET` - Secret path for webhook endpoint (auto-generated if not set)
+
+### Running the Bot
+- **Development**: Starts automatically via `scripts/inngest.sh` (runs `src/server.ts`)
+- **Production**: Use `scripts/start-production.sh` which runs both bot and Mastra API
+- **Build**: `scripts/build.sh` builds both Mastra and the bot server
+
+### Production Deployment Requirements
+Update `.replit` deployment run command to:
+```
+run = ["bash", "scripts/start-production.sh"]
+```
 
 ### Bot Commands
 - `/ping` - Connection test (responds "pong ✅")
-- `/health` - System status (DB, OpenAI, errors)
+- `/health` - System status (DB, OpenAI, mode, uptime, errors)
 - `/start` - Welcome message
 - `/help` - Available commands
 - `/balance` - Current balance

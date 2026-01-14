@@ -1,0 +1,50 @@
+You said production still has a ports/.replit issue. Fix it from the root, not with workarounds.
+
+Goal:
+- Make the Telegram bot run reliably in BOTH dev and production on Replit.
+- In dev: keep polling (simple).
+- In prod: do NOT rely on polling. Use a webhook + an HTTP server bound to 0.0.0.0 and PORT.
+- Ensure Replit sees a listening web server on PORT so the deployment stays healthy.
+- Remove any manual port edits. The repo should be self-contained and deployable.
+
+Constraints:
+- Node.js ESM environment (type: module). No require() anywhere.
+- The bot must NOT crash if DB fails. Keep existing try/catch resilience.
+- Implement a single entrypoint that starts:
+  1) Express/Fastify (your choice) server with /health, /ping endpoints
+  2) Telegram bot in polling OR webhook mode depending on env
+
+What to do (deliverables required):
+1) Detect runtime mode using env vars:
+   - If NODE_ENV === "production" OR REPLIT_DEPLOYMENT === "1": production mode.
+   - Else: development mode.
+2) In production mode:
+   - Start HTTP server on host 0.0.0.0 and port process.env.PORT (fallback 3000).
+   - Configure Telegram webhook to https://<public-replit-url>/<secret-path>
+     - Use process.env.REPLIT_URL if available, else read from docs and implement a safe fallback.
+     - The webhook path must use a secret token: process.env.WEBHOOK_SECRET (generate if missing and log a warning).
+   - Add route POST /telegram/<secret> that passes updates to the bot.
+   - Ensure webhook is set on startup (and updated if URL changes).
+3) In dev mode:
+   - Start the same HTTP server (still bind 0.0.0.0:PORT) so Replit is happy.
+   - Start bot in polling mode only in dev.
+   - Ensure no webhook is set in dev (optional: deleteWebhook).
+4) Update project scripts:
+   - package.json: "dev": "tsx watch src/index.ts", "start": "node dist/index.js", "build": "tsc"
+     (or use tsx for start if no build; but be consistent).
+5) Fix .replit and replit.nix (if present) so:
+   - run command uses npm run dev for workspace OR npm start for deployment as appropriate.
+   - No manual ports config needed. It must just work by reading PORT.
+6) Provide final code changes as:
+   - src/index.ts (new main entry)
+   - src/bot.ts adjusted to support webhook handler OR expose bot instance/handleUpdate
+   - src/server.ts (optional)
+   - .replit updated
+   - Any needed env example (.env.example)
+
+Acceptance criteria:
+- When running in Replit workspace, `npm run dev` starts server + bot polling, /health returns 200.
+- When deployed, deployment stays alive (because server listens on PORT), webhook receives updates, bot responds.
+- No manual editing of ports in the Replit UI is required.
+
+Now implement the fix, show the exact code diffs/files, and explain briefly what changed.

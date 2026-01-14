@@ -4,14 +4,16 @@ set -e
 
 echo "🚀 Starting production environment..."
 
-export PORT="${PORT:-5000}"
-echo "📡 Using PORT: $PORT"
+BOT_PORT="${PORT:-5000}"
+MASTRA_PORT=5001
 
-echo "🤖 Starting Telegram polling bot..."
-node dist/bot.js &
+echo "🤖 Starting unified bot server on port ${BOT_PORT}..."
+PORT="${BOT_PORT}" NODE_ENV=production node dist/server.js &
 BOT_PID=$!
-echo "✅ Bot started with PID: $BOT_PID"
+echo "✅ Bot server started with PID: $BOT_PID"
 
-echo "🌐 Starting Mastra API server..."
+sleep 2
+
+echo "🌐 Starting Mastra API server on port ${MASTRA_PORT}..."
 cd .mastra/output
-exec node index.mjs
+PORT="${MASTRA_PORT}" exec node index.mjs
