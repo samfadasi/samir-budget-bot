@@ -1,32 +1,29 @@
-bot.command("month", async (ctx) => {
+let pool = null;
+let DB_STATUS = "disabled";
+
+async function initDbSafe() {
   try {
-    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
+    const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+    if (!DATABASE_URL) {
+      DB_STATUS = "disabled";
+      return;
+    }
 
-    const uid = ctx.from.id;
+    // dynamic import عشان لو pg غير مثبت ما يكراش التطبيق
+    const pg = await import("pg");
+    const { Pool } = pg.default || pg;
 
-    // YYYY-MM (this month)
-    const now = new Date();
-    const m = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
 
-    const r = await pool.query(
-      `select category, coalesce(sum(amount),0)::numeric as total
-       from tx
-       where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
-       group by category
-       order by total desc`,
-      [uid, m]
-    );
-
-    if (!r.rowCount) return ctx.reply(`📊 شهر ${m}: ما في مصروفات مسجلة.`);
-
-    const total = r.rows.reduce((s, x) => s + Number(x.total), 0);
-    const lines = r.rows
-      .map((x) => `- ${x.category}: ${Number(x.total).toFixed(2)} SAR`)
-      .join("\n");
-
-    return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${total.toFixed(2)} SAR`);
+    await pool.query("select 1");
+    DB_STATUS = "enabled";
+    console.log("DB READY");
   } catch (e) {
-    console.error("MONTH_FAIL:", e);
-    return ctx.reply("⚠️ حصل خطأ في تقرير الشهر. راجع Logs في Railway.");
+    DB_STATUS = "error";
+    console.error("DB INIT FAIL:", e);
+    pool = null; // المهم: ما تكراش
   }
-});
+}
