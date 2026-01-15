@@ -107,7 +107,7 @@ async function initDb() {
   } catch (e) {
     DB_STATUS = "error";
     setDbError(e);
-    pool = null; // do not crash
+    pool = null;
   }
 }
 
@@ -133,15 +133,15 @@ function thisMonthKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
+function ensureMonthFormat(m) {
+  return /^\d{4}-\d{2}$/.test(m);
+}
 function safeNum(n, fallback = 0) {
   const x = Number(n);
   return Number.isFinite(x) ? x : fallback;
 }
 function formatMoney(n) {
   return safeNum(n).toFixed(2);
-}
-function ensureMonthFormat(m) {
-  return /^\d{4}-\d{2}$/.test(m);
 }
 
 // =====================
@@ -190,6 +190,7 @@ async function extractExpense(text) {
   if (/(ريال|ر\.?س)/i.test(text) || currency === "ريال" || currency === "SR") currency = "SAR";
 
   const vendor = String(obj.vendor || "Unknown").trim() || "Unknown";
+
   let category = String(obj.category || "Uncategorized").trim() || "Uncategorized";
   if (!CATEGORIES.includes(category)) category = "Uncategorized";
 
@@ -249,14 +250,18 @@ async function checkBudgetAlerts(ctx, tgUserId, tx) {
   const pct = (spent / b.budget) * 100;
 
   if (pct >= 100) {
-    await ctx.reply(`🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`);
+    await ctx.reply(
+      `🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`
+    );
   } else if (pct >= 80) {
-    await ctx.reply(`⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`);
+    await ctx.reply(
+      `⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`
+    );
   }
 }
 
 // =====================
-// PDF GENERATION
+// PDF GENERATION (FIXED LAYOUT)
 // =====================
 function collectPdfBuffer(doc) {
   return new Promise((resolve, reject) => {
@@ -276,13 +281,18 @@ function tryLogo(doc) {
   } catch (_) {}
 }
 
+// Hard-positioned header to prevent overlaps
 function header(doc, title, sub) {
   tryLogo(doc);
-  doc.fontSize(16).text(COMPANY_NAME, 110, 40);
-  doc.fontSize(14).text(title, 110, 62);
-  doc.fontSize(10).fillColor("#444").text(sub, 110, 82).fillColor("#000");
-  doc.moveTo(40, 110).lineTo(555, 110).stroke();
-  doc.y = 130;
+
+  doc.fontSize(16).text(COMPANY_NAME, 110, 40, { lineGap: 2 });
+  doc.fontSize(14).text(title, 110, 62, { lineGap: 2 });
+  doc.fontSize(10).fillColor("#444").text(sub, 110, 84, { lineGap: 2 }).fillColor("#000");
+
+  doc.moveTo(40, 118).lineTo(555, 118).stroke();
+
+  // Critical: set Y to a known safe position
+  doc.y = 140;
 }
 
 function table(doc, cols, rows) {
@@ -291,7 +301,7 @@ function table(doc, cols, rows) {
   const rowH = 18;
   const totalW = cols.reduce((s, c) => s + c.w, 0);
 
-  // header bg
+  // Header background
   doc.rect(startX, y, totalW, rowH).fill("#f0f0f0");
   doc.fillColor("#000").fontSize(10);
 
@@ -302,11 +312,14 @@ function table(doc, cols, rows) {
   }
   y += rowH;
 
+  doc.fontSize(10).fillColor("#000");
   for (const r of rows) {
     if (y > 760) {
       doc.addPage();
+      // reset top on new pages
       y = 60;
     }
+
     x = startX;
     for (let i = 0; i < cols.length; i++) {
       doc.rect(x, y, cols[i].w, rowH).strokeColor("#ddd").stroke();
@@ -316,7 +329,8 @@ function table(doc, cols, rows) {
     }
     y += rowH;
   }
-  doc.y = y + 10;
+
+  doc.y = y + 12;
 }
 
 async function buildTodayPdf(tgUserId) {
@@ -332,15 +346,18 @@ async function buildTodayPdf(tgUserId) {
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
   header(doc, "Daily Expense Report", `Date: ${d} | Currency: SAR`);
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`).moveDown(0.8);
+
+  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`, { lineGap: 2 });
+  doc.y += 12; // hard spacing to prevent overlap
 
   const cols = [
     { h: "Date", w: 70 },
-    { h: "Amount", w: 70 },
+    { h: "Amount", w: 80 },
     { h: "Category", w: 90 },
     { h: "Vendor", w: 170 },
-    { h: "Notes", w: 155 },
+    { h: "Notes", w: 145 },
   ];
+
   const rows = r.rows.map((x) => [
     x.tx_date,
     `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
@@ -378,9 +395,13 @@ async function buildMonthPdf(tgUserId, month) {
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
   header(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`).moveDown(0.8);
 
-  doc.fontSize(12).text("Summary by Category").moveDown(0.4);
+  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`, { lineGap: 2 });
+  doc.y += 12;
+
+  doc.fontSize(12).text("Summary by Category");
+  doc.y += 8;
+
   table(
     doc,
     [
@@ -395,14 +416,17 @@ async function buildMonthPdf(tgUserId, month) {
     })
   );
 
-  doc.fontSize(12).text("Detailed Transactions").moveDown(0.4);
+  doc.fontSize(12).text("Detailed Transactions");
+  doc.y += 8;
+
   const cols = [
     { h: "Date", w: 70 },
-    { h: "Amount", w: 70 },
+    { h: "Amount", w: 80 },
     { h: "Category", w: 90 },
     { h: "Vendor", w: 170 },
-    { h: "Notes", w: 155 },
+    { h: "Notes", w: 145 },
   ];
+
   const rows = tx.rows.map((x) => [
     x.tx_date,
     `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
@@ -419,10 +443,19 @@ async function buildMonthPdf(tgUserId, month) {
 }
 
 // =====================
-// COMMANDS + HANDLERS
+// ERROR LOGGING
+// =====================
+bot.catch((e) => console.error("BOT ERROR:", e));
+process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
+
+console.log("BOOT: accounting-bot-clean-v2 (pdf layout fixed)");
+
+// =====================
+// COMMANDS
 // =====================
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v1"));
+bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v2"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
