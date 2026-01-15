@@ -17,7 +17,8 @@ const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const COMPANY_NAME = (process.env.COMPANY_NAME || "Samir Budget Bot").trim();
-const LOGO_PATH = (process.env.LOGO_PATH || "").trim(); // e.g. "attached_assets/logo.png"
+const AR_FONT_PATH = (process.env.AR_FONT_PATH || "assets/fonts/Cairo-Regular.ttf").trim();
+const CURRENCY_DEFAULT = (process.env.CURRENCY_DEFAULT || "SAR").trim();
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("FATAL: TELEGRAM_BOT_TOKEN missing");
@@ -25,7 +26,7 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 
 // =====================
-// KEEP-ALIVE HTTP
+// KEEP-ALIVE HTTP (Railway friendly)
 // =====================
 const PORT = Number(process.env.PORT || 3000);
 http
@@ -41,8 +42,14 @@ http
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
+// Avoid crash on updates without user (channel/system updates)
+bot.use((ctx, next) => {
+  if (!ctx.from) return;
+  return next();
+});
+
 // =====================
-// DB (SAFE INIT)
+// DB
 // =====================
 let pool = null;
 let DB_STATUS = "disabled";
@@ -72,7 +79,7 @@ async function initDb() {
         tg_user_id bigint not null,
         tx_date date not null,
         amount numeric(12,2) not null,
-        currency text not null default 'SAR',
+        currency text not null default '${CURRENCY_DEFAULT}',
         vendor text,
         category text,
         description text,
@@ -80,22 +87,16 @@ async function initDb() {
         created_at timestamptz not null default now()
       );
 
-      create index if not exists idx_tx_user_date
-        on tx (tg_user_id, tx_date);
-
-      create index if not exists idx_tx_user_created
-        on tx (tg_user_id, created_at desc);
-
-      create index if not exists idx_tx_user_month_cat
-        on tx (tg_user_id, category, tx_date);
+      create index if not exists idx_tx_user_date on tx (tg_user_id, tx_date);
+      create index if not exists idx_tx_user_created on tx (tg_user_id, created_at desc);
 
       create table if not exists budgets (
         id bigserial primary key,
         tg_user_id bigint not null,
-        month text not null,      -- YYYY-MM
+        month text not null, -- YYYY-MM
         category text not null,
         amount numeric(12,2) not null,
-        currency text not null default 'SAR',
+        currency text not null default '${CURRENCY_DEFAULT}',
         created_at timestamptz not null default now(),
         unique (tg_user_id, month, category)
       );
@@ -111,7 +112,7 @@ async function initDb() {
 }
 
 // =====================
-// HELPERS
+// CONSTANTS / HELPERS
 // =====================
 const CATEGORIES = [
   "Food",
@@ -145,9 +146,20 @@ function formatMoney(n) {
 function normalizeCell(v) {
   return (v ?? "").toString().replace(/\s+/g, " ").trim();
 }
+function hasArabic(text) {
+  return /[\u0600-\u06FF]/.test(text || "");
+}
+function fmtDate(v) {
+  // We want YYYY-MM-DD only (no 00:00:00)
+  if (!v) return "";
+  if (typeof v === "string") return v.slice(0, 10);
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v).slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
 
 // =====================
-// AI Extract (Strict JSON)
+// AI EXTRACT (STRICT JSON)
 // =====================
 async function extractExpense(text) {
   if (!openai) throw new Error("OpenAI disabled");
@@ -156,6 +168,8 @@ async function extractExpense(text) {
 
   const res = await openai.chat.completions.create({
     model: OPENAI_MODEL,
+    temperature: 0,
+    response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
@@ -168,16 +182,14 @@ async function extractExpense(text) {
         content:
           `Today is ${today}.\n` +
           `Extract ONE expense from Arabic/English:\n` +
-          `"${text}"\n` +
+          `"${text}"\n\n` +
           `Rules:\n` +
-          `- "ريال" means SAR.\n` +
+          `- "ريال" or "ر.س" means SAR.\n` +
           `- Meals/restaurant/coffee (غداء/عشاء/فطور/مطعم/قهوة) => category Food.\n` +
           `- If date missing => today.\n` +
           `Return JSON only.`,
       },
     ],
-    response_format: { type: "json_object" },
-    temperature: 0,
   });
 
   const out = res.choices?.[0]?.message?.content?.trim() || "{}";
@@ -188,7 +200,7 @@ async function extractExpense(text) {
 
   const tx_date = String(obj.tx_date || today).slice(0, 10);
 
-  let currency = String(obj.currency || "SAR").trim().toUpperCase();
+  let currency = String(obj.currency || CURRENCY_DEFAULT).trim().toUpperCase();
   if (/(ريال|ر\.?س)/i.test(text) || currency === "ريال" || currency === "SR") currency = "SAR";
 
   const vendor = String(obj.vendor || "Unknown").trim() || "Unknown";
@@ -202,7 +214,7 @@ async function extractExpense(text) {
 }
 
 // =====================
-// DB OPS + ALERTS
+// DB OPS
 // =====================
 async function saveTx(tgUserId, tx, rawText) {
   if (!pool) return "NO_DB";
@@ -253,17 +265,19 @@ async function checkBudgetAlerts(ctx, tgUserId, tx) {
 
   if (pct >= 100) {
     await ctx.reply(
-      `🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`
+      `🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n` +
+        `${formatMoney(spent)} / ${formatMoney(b.budget)} ${CURRENCY_DEFAULT}`
     );
   } else if (pct >= 80) {
     await ctx.reply(
-      `⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n${formatMoney(spent)} / ${formatMoney(b.budget)} SAR`
+      `⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n` +
+        `${formatMoney(spent)} / ${formatMoney(b.budget)} ${CURRENCY_DEFAULT}`
     );
   }
 }
 
 // =====================
-// PDF GENERATION (NO OVERLAP, NO TRUNCATION)
+// PDF (NO OVERLAP + ARABIC FONT)
 // =====================
 function collectPdfBuffer(doc) {
   return new Promise((resolve, reject) => {
@@ -275,31 +289,35 @@ function collectPdfBuffer(doc) {
   });
 }
 
-function tryLogo(doc) {
-  if (!LOGO_PATH) return;
+function absFontPath(p) {
+  return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+}
+
+function registerFonts(doc) {
   try {
-    const abs = path.isAbsolute(LOGO_PATH) ? LOGO_PATH : path.join(process.cwd(), LOGO_PATH);
-    if (fs.existsSync(abs)) doc.image(abs, 40, 40, { width: 60 });
+    const abs = absFontPath(AR_FONT_PATH);
+    if (fs.existsSync(abs)) doc.registerFont("AR", abs);
   } catch (_) {}
 }
 
+function setFont(doc, text) {
+  // If Arabic and registered, use it, else Helvetica
+  if (hasArabic(text) && doc._registeredFonts?.AR) doc.font("AR");
+  else doc.font("Helvetica");
+}
+
 function drawHeader(doc, title, sub) {
-  tryLogo(doc);
-
-  doc.fontSize(16).text(COMPANY_NAME, 110, 40);
-  doc.fontSize(14).text(title, 110, 62);
-  doc.fontSize(10).fillColor("#444").text(sub, 110, 84).fillColor("#000");
-
+  doc.font("Helvetica").fontSize(16).text(COMPANY_NAME, 40, 40);
+  doc.font("Helvetica").fontSize(14).text(title, 40, 62);
+  doc.font("Helvetica").fontSize(10).fillColor("#444").text(sub, 40, 84).fillColor("#000");
   doc.moveTo(40, 118).lineTo(555, 118).stroke();
-
-  // safe cursor
   doc.y = 140;
 }
 
 function drawTableHeader(doc, cols, startX, y, headerH) {
   const totalW = cols.reduce((s, c) => s + c.w, 0);
   doc.rect(startX, y, totalW, headerH).fill("#f0f0f0");
-  doc.fillColor("#000").fontSize(10);
+  doc.fillColor("#000").fontSize(10).font("Helvetica");
 
   let x = startX;
   for (const c of cols) {
@@ -309,61 +327,57 @@ function drawTableHeader(doc, cols, startX, y, headerH) {
   return y + headerH;
 }
 
-/**
- * Dynamic-height table:
- * - calculates row height based on the tallest cell (using heightOfString)
- * - wraps text naturally inside the cell width
- * - prevents overlaps by advancing Y correctly
- */
 function drawTableDynamic(doc, cols, rows, options = {}) {
   const startX = options.startX ?? 40;
-  const pageBottomY = options.pageBottomY ?? 780; // safe bottom
+  const pageBottomY = options.pageBottomY ?? 780;
   const headerH = options.headerH ?? 22;
   const paddingX = options.paddingX ?? 4;
   const paddingY = options.paddingY ?? 6;
   const minRowH = options.minRowH ?? 20;
 
-  // set consistent font for measurement & drawing
   doc.fontSize(10);
 
   let y = options.startY ?? doc.y;
-
-  // draw first header
   y = drawTableHeader(doc, cols, startX, y, headerH);
 
   for (const row of rows) {
-    // measure row height
     let rowH = minRowH;
+
+    // compute row height by measuring each cell
     for (let i = 0; i < cols.length; i++) {
-      const text = normalizeCell(row[i]);
+      const raw = normalizeCell(row[i]);
       const w = cols[i].w - paddingX * 2;
-      const h = doc.heightOfString(text || " ", {
-        width: w,
-        align: "left",
-      });
+
+      setFont(doc, raw);
+      const h = doc.heightOfString(raw || " ", { width: w, align: "left" });
+      doc.font("Helvetica");
+
       const needed = h + paddingY * 2;
       if (needed > rowH) rowH = needed;
     }
 
-    // page break with header repeat
+    // page break
     if (y + rowH > pageBottomY) {
       doc.addPage();
       y = 60;
       y = drawTableHeader(doc, cols, startX, y, headerH);
     }
 
-    // draw row cells
+    // draw cells
     let x = startX;
     for (let i = 0; i < cols.length; i++) {
       const w = cols[i].w;
+
       doc.rect(x, y, w, rowH).strokeColor("#dddddd").stroke();
       doc.strokeColor("#000000");
 
-      const text = normalizeCell(row[i]);
-      doc.text(text, x + paddingX, y + paddingY, {
+      const raw = normalizeCell(row[i]);
+      setFont(doc, raw);
+      doc.text(raw, x + paddingX, y + paddingY, {
         width: w - paddingX * 2,
         align: "left",
       });
+      doc.font("Helvetica");
 
       x += w;
     }
@@ -376,8 +390,11 @@ function drawTableDynamic(doc, cols, rows, options = {}) {
 
 async function buildTodayPdf(tgUserId) {
   const d = todayISO();
+
+  // IMPORTANT: tx_date returned as string => no 00:00:00
   const r = await pool.query(
-    `select tx_date, amount::numeric as amount, currency, vendor, category, description
+    `select to_char(tx_date,'YYYY-MM-DD') as tx_date,
+            amount::numeric as amount, currency, vendor, category, description
      from tx
      where tg_user_id=$1 and tx_date=$2
      order by created_at desc`,
@@ -387,9 +404,10 @@ async function buildTodayPdf(tgUserId) {
   const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  drawHeader(doc, "Daily Expense Report", `Date: ${d} | Currency: SAR`);
+  registerFonts(doc);
+  drawHeader(doc, "Daily Expense Report", `Date: ${d} | Currency: ${CURRENCY_DEFAULT}`);
 
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`);
+  doc.font("Helvetica").fontSize(11).text(`Total: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
   doc.y += 10;
 
   const cols = [
@@ -401,26 +419,25 @@ async function buildTodayPdf(tgUserId) {
   ];
 
   const rows = r.rows.map((x) => [
-    x.tx_date,
-    `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
+    fmtDate(x.tx_date),
+    `${formatMoney(x.amount)} ${x.currency || CURRENCY_DEFAULT}`,
     x.category || "",
     x.vendor || "",
     x.description || "",
   ]);
 
-  if (!rows.length) {
-    doc.fontSize(12).text("No transactions found for today.");
-  } else {
-    drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
-  }
+  if (!rows.length) doc.font("Helvetica").fontSize(12).text("No transactions found for today.");
+  else drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
 
-  doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
+  doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
 }
 
 async function buildMonthPdf(tgUserId, month) {
+  // IMPORTANT: tx_date returned as string => no 00:00:00
   const tx = await pool.query(
-    `select tx_date, amount::numeric as amount, currency, vendor, category, description
+    `select to_char(tx_date,'YYYY-MM-DD') as tx_date,
+            amount::numeric as amount, currency, vendor, category, description
      from tx
      where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
      order by tx_date desc, created_at desc`,
@@ -439,32 +456,30 @@ async function buildMonthPdf(tgUserId, month) {
   const total = byCat.rows.reduce((s, x) => s + safeNum(x.total), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  drawHeader(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
+  registerFonts(doc);
+  drawHeader(doc, "Monthly Expense Report", `Month: ${month} | Currency: ${CURRENCY_DEFAULT}`);
 
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`);
+  doc.font("Helvetica").fontSize(11).text(`Total: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
   doc.y += 12;
 
-  doc.fontSize(12).text("Summary by Category");
+  doc.font("Helvetica").fontSize(12).text("Summary by Category");
   doc.y += 8;
 
   const summaryCols = [
     { h: "Category", w: 260 },
-    { h: "Total (SAR)", w: 120 },
+    { h: "Total", w: 120 },
     { h: "Share", w: 135 },
   ];
   const summaryRows = byCat.rows.map((x) => {
     const t = safeNum(x.total);
     const pct = total > 0 ? `${Math.round((t / total) * 100)}%` : "0%";
-    return [x.category || "Uncategorized", formatMoney(t), pct];
+    return [x.category || "Uncategorized", `${formatMoney(t)} ${CURRENCY_DEFAULT}`, pct];
   });
 
-  if (summaryRows.length) {
-    drawTableDynamic(doc, summaryCols, summaryRows, { startY: doc.y, pageBottomY: 780 });
-  } else {
-    doc.fontSize(11).text("No summary data.");
-  }
+  if (summaryRows.length) drawTableDynamic(doc, summaryCols, summaryRows, { startY: doc.y, pageBottomY: 780 });
+  else doc.font("Helvetica").fontSize(11).text("No summary data.");
 
-  doc.fontSize(12).text("Detailed Transactions");
+  doc.font("Helvetica").fontSize(12).text("Detailed Transactions");
   doc.y += 8;
 
   const cols = [
@@ -476,20 +491,17 @@ async function buildMonthPdf(tgUserId, month) {
   ];
 
   const rows = tx.rows.map((x) => [
-    x.tx_date,
-    `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
+    fmtDate(x.tx_date),
+    `${formatMoney(x.amount)} ${x.currency || CURRENCY_DEFAULT}`,
     x.category || "",
     x.vendor || "",
     x.description || "",
   ]);
 
-  if (!rows.length) {
-    doc.fontSize(12).text("No transactions found for this month.");
-  } else {
-    drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
-  }
+  if (!rows.length) doc.font("Helvetica").fontSize(12).text("No transactions found for this month.");
+  else drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
 
-  doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
+  doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
 }
 
@@ -497,28 +509,17 @@ async function buildMonthPdf(tgUserId, month) {
 // COMMANDS
 // =====================
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v3-dynamic-pdf"));
+bot.command("version", (ctx) => ctx.reply("version: railway-bot-v1"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
     `openai: ${openai ? "yes" : "no"}\n` +
       `model: ${OPENAI_MODEL}\n` +
       `db: ${DB_STATUS}\n` +
+      `ar_font: ${AR_FONT_PATH}\n` +
       (DB_ERROR ? `db_error: ${DB_ERROR.slice(0, 180)}` : "")
   );
 });
-
-bot.command("start", (ctx) =>
-  ctx.reply(
-    "✅ شغال.\n" +
-      "سجّل مصروف: دفعت 40 ريال للغداء من مطعم...\n\n" +
-      "تقارير: /today /month /last 10 /sum Food\n" +
-      "ميزانيات: /setbudget Food 300 /budget\n" +
-      "PDF: /exportpdf today | /exportpdf month [YYYY-MM]\n" +
-      "تصحيح: /del last\n" +
-      "تشخيص: /ping /env /version"
-  )
-);
 
 bot.command("today", async (ctx) => {
   try {
@@ -540,7 +541,7 @@ bot.command("today", async (ctx) => {
     const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
     const lines = r.rows.map((x) => `- ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`).join("\n");
 
-    return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
+    return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
   } catch (e) {
     console.error("TODAY_FAIL:", e);
     return ctx.reply("⚠️ خطأ في تقرير اليوم. راجع Logs.");
@@ -565,67 +566,12 @@ bot.command("month", async (ctx) => {
     if (!r.rowCount) return ctx.reply(`📊 شهر ${m}: ما في مصروفات مسجلة.`);
 
     const total = r.rows.reduce((s, x) => s + safeNum(x.total), 0);
-    const lines = r.rows.map((x) => `- ${x.category}: ${formatMoney(x.total)} SAR`).join("\n");
+    const lines = r.rows.map((x) => `- ${x.category}: ${formatMoney(x.total)} ${CURRENCY_DEFAULT}`).join("\n");
 
-    return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
+    return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
   } catch (e) {
     console.error("MONTH_FAIL:", e);
     return ctx.reply("⚠️ خطأ في تقرير الشهر. راجع Logs.");
-  }
-});
-
-bot.command("last", async (ctx) => {
-  try {
-    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
-    const uid = ctx.from.id;
-    const parts = (ctx.message?.text || "").trim().split(/\s+/);
-    const n = Math.min(Math.max(Number(parts[1] || 10), 1), 50);
-
-    const r = await pool.query(
-      `select tx_date, amount::numeric as amount, currency, vendor, category
-       from tx
-       where tg_user_id=$1
-       order by created_at desc
-       limit $2`,
-      [uid, n]
-    );
-
-    if (!r.rowCount) return ctx.reply("ما في عمليات مسجلة.");
-
-    const lines = r.rows
-      .map((x) => `- ${x.tx_date} | ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`)
-      .join("\n");
-
-    return ctx.reply(`🧾 آخر ${n} عمليات:\n${lines}`);
-  } catch (e) {
-    console.error("LAST_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في /last. راجع Logs.");
-  }
-});
-
-bot.command("sum", async (ctx) => {
-  try {
-    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
-    const uid = ctx.from.id;
-
-    const parts = (ctx.message?.text || "").trim().split(/\s+/);
-    const category = parts[1];
-    const month = (parts[2] || thisMonthKey()).trim();
-
-    if (!category) return ctx.reply("استخدم: /sum Food أو /sum Food 2026-01");
-    if (!ensureMonthFormat(month)) return ctx.reply("صيغة الشهر غلط. استخدم YYYY-MM مثل 2026-01");
-
-    const r = await pool.query(
-      `select coalesce(sum(amount),0)::numeric as total
-       from tx
-       where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2 and category=$3`,
-      [uid, month, category]
-    );
-
-    return ctx.reply(`📌 مجموع ${category} لشهر ${month}: ${formatMoney(r.rows[0].total)} SAR`);
-  } catch (e) {
-    console.error("SUM_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في /sum. راجع Logs.");
   }
 });
 
@@ -651,13 +597,13 @@ bot.command("setbudget", async (ctx) => {
 
     await pool.query(
       `insert into budgets (tg_user_id, month, category, amount, currency)
-       values ($1,$2,$3,$4,'SAR')
+       values ($1,$2,$3,$4,$5)
        on conflict (tg_user_id, month, category)
-       do update set amount=excluded.amount, currency='SAR'`,
-      [uid, month, category, amount]
+       do update set amount=excluded.amount, currency=excluded.currency`,
+      [uid, month, category, amount, CURRENCY_DEFAULT]
     );
 
-    return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${formatMoney(amount)} SAR`);
+    return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${formatMoney(amount)} ${CURRENCY_DEFAULT}`);
   } catch (e) {
     console.error("SETBUDGET_FAIL:", e);
     return ctx.reply("⚠️ فشل ضبط الميزانية. راجع Logs.");
@@ -694,43 +640,13 @@ bot.command("budget", async (ctx) => {
       const s = spentMap.get(b.category) || 0;
       const bud = safeNum(b.budget);
       const pct = bud > 0 ? Math.round((s / bud) * 100) : 0;
-      return `- ${b.category}: ${formatMoney(s)} / ${formatMoney(bud)} SAR (${pct}%)`;
+      return `- ${b.category}: ${formatMoney(s)} / ${formatMoney(bud)} ${CURRENCY_DEFAULT} (${pct}%)`;
     });
 
     return ctx.reply(`📌 ميزانيات شهر ${month}\n${lines.join("\n")}`);
   } catch (e) {
     console.error("BUDGET_FAIL:", e);
     return ctx.reply("⚠️ فشل عرض الميزانيات. راجع Logs.");
-  }
-});
-
-bot.command("del", async (ctx) => {
-  try {
-    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
-    const uid = ctx.from.id;
-
-    const parts = (ctx.message?.text || "").trim().split(/\s+/);
-    if ((parts[1] || "").toLowerCase() !== "last") return ctx.reply("استخدم: /del last");
-
-    const r = await pool.query(
-      `delete from tx
-       where id = (
-         select id from tx
-         where tg_user_id=$1
-         order by created_at desc
-         limit 1
-       )
-       returning tx_date, amount::numeric as amount, currency, vendor, category`,
-      [uid]
-    );
-
-    if (!r.rowCount) return ctx.reply("ما في عمليات للحذف.");
-
-    const x = r.rows[0];
-    return ctx.reply(`🗑️ تم حذف آخر عملية:\n${x.tx_date} | ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`);
-  } catch (e) {
-    console.error("DEL_FAIL:", e);
-    return ctx.reply("⚠️ فشل الحذف. راجع Logs.");
   }
 });
 
@@ -761,7 +677,9 @@ bot.command("exportpdf", async (ctx) => {
   }
 });
 
-// Expense message
+// =====================
+// EXPENSE MESSAGE
+// =====================
 bot.on("text", async (ctx) => {
   const text = (ctx.message?.text || "").trim();
   if (!text || text.startsWith("/")) return;
@@ -806,6 +724,8 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
 (async () => {
   try {
     await initDb();
+
+    // ensure polling (no webhook)
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
     const me = await bot.telegram.getMe();
