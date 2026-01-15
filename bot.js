@@ -61,6 +61,7 @@ async function initDb() {
 
     await pool.query("select 1");
 
+    // tx table
     await pool.query(`
       create table if not exists tx (
         id bigserial primary key,
@@ -77,6 +78,23 @@ async function initDb() {
 
       create index if not exists idx_tx_user_date
         on tx (tg_user_id, tx_date);
+
+      create index if not exists idx_tx_user_month_cat
+        on tx (tg_user_id, category, tx_date);
+    `);
+
+    // budgets table
+    await pool.query(`
+      create table if not exists budgets (
+        id bigserial primary key,
+        tg_user_id bigint not null,
+        month text not null,      -- YYYY-MM
+        category text not null,
+        amount numeric(12,2) not null,
+        currency text not null default 'SAR',
+        created_at timestamptz not null default now(),
+        unique (tg_user_id, month, category)
+      );
     `);
 
     DB_STATUS = "enabled";
@@ -91,13 +109,25 @@ async function initDb() {
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
-function monthKey() {
+function thisMonthKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+const CATEGORIES = [
+  "Food",
+  "Transport",
+  "Utilities",
+  "Rent",
+  "Business",
+  "Personal",
+  "Equipment",
+  "Raw materials",
+  "Uncategorized",
+];
+
 // =====================
-// AI Extract (Stable JSON)
+// AI Extract (Strict JSON)
 // =====================
 async function extractExpense(text) {
   if (!openai) throw new Error("OpenAI disabled");
@@ -111,7 +141,7 @@ async function extractExpense(text) {
         role: "system",
         content:
           "Return ONLY JSON with keys: tx_date, amount, currency, vendor, category, description. " +
-          "category must be one of: Food, Transport, Utilities, Rent, Business, Personal, Equipment, Raw materials, Uncategorized.",
+          `category must be one of: ${CATEGORIES.join(", ")}.`,
       },
       {
         role: "user",
@@ -142,14 +172,16 @@ async function extractExpense(text) {
   if (/(ريال|ر\.?س)/i.test(text) || currency === "ريال" || currency === "SR") currency = "SAR";
 
   const vendor = String(obj.vendor || "Unknown").trim() || "Unknown";
-  const category = String(obj.category || "Uncategorized").trim() || "Uncategorized";
+  let category = String(obj.category || "Uncategorized").trim() || "Uncategorized";
+  if (!CATEGORIES.includes(category)) category = "Uncategorized";
+
   const description = String(obj.description || "").trim();
 
   return { tx_date, amount, currency, vendor, category, description };
 }
 
 // =====================
-// Save Tx
+// TX Save + Budget Alerts
 // =====================
 async function saveTx(tgUserId, tx, rawText) {
   if (!pool) return "NO_DB";
@@ -166,6 +198,45 @@ async function saveTx(tgUserId, tx, rawText) {
   }
 }
 
+async function getBudget(tgUserId, month, category) {
+  if (!pool) return null;
+  const r = await pool.query(
+    `select amount::numeric as budget, currency
+     from budgets
+     where tg_user_id=$1 and month=$2 and category=$3`,
+    [tgUserId, month, category]
+  );
+  return r.rowCount ? { budget: Number(r.rows[0].budget), currency: r.rows[0].currency } : null;
+}
+
+async function getSpent(tgUserId, month, category) {
+  if (!pool) return 0;
+  const r = await pool.query(
+    `select coalesce(sum(amount),0)::numeric as spent
+     from tx
+     where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2 and category=$3`,
+    [tgUserId, month, category]
+  );
+  return Number(r.rows[0].spent || 0);
+}
+
+async function checkBudgetAlerts(ctx, tgUserId, tx) {
+  if (!pool) return;
+
+  const month = String(tx.tx_date).slice(0, 7);
+  const b = await getBudget(tgUserId, month, tx.category);
+  if (!b || !Number.isFinite(b.budget) || b.budget <= 0) return;
+
+  const spent = await getSpent(tgUserId, month, tx.category);
+  const pct = (spent / b.budget) * 100;
+
+  if (pct >= 100) {
+    await ctx.reply(`🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n${spent.toFixed(2)} / ${b.budget.toFixed(2)} SAR`);
+  } else if (pct >= 80) {
+    await ctx.reply(`⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n${spent.toFixed(2)} / ${b.budget.toFixed(2)} SAR`);
+  }
+}
+
 // =====================
 // ERROR LOGGING
 // =====================
@@ -173,7 +244,7 @@ bot.catch((e) => console.error("BOT ERROR:", e));
 process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
 process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
 
-console.log("BOOT: accounting-bot v3");
+console.log("BOOT: accounting-bot v4 (budgets)");
 
 // =====================
 // COMMANDS
@@ -182,16 +253,19 @@ bot.command("start", (ctx) =>
   ctx.reply(
     "✅ شغال.\n" +
       "أرسل مصروف مثل: دفعت 40 ريال للغداء من مطعم...\n\n" +
-      "أوامر:\n" +
-      "/ping\n" +
-      "/env\n" +
+      "تقارير:\n" +
       "/today\n" +
-      "/month\n"
+      "/month\n\n" +
+      "ميزانيات:\n" +
+      "/setbudget Food 300\n" +
+      "/budget\n\n" +
+      "تشخيص:\n" +
+      "/ping /env /version"
   )
 );
 
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: accounting-bot-v3"));
+bot.command("version", (ctx) => ctx.reply("version: accounting-bot-v4"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
@@ -235,7 +309,7 @@ bot.command("month", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
     const uid = ctx.from.id;
-    const m = monthKey();
+    const m = thisMonthKey();
 
     const r = await pool.query(
       `select category, coalesce(sum(amount),0)::numeric as total
@@ -255,6 +329,85 @@ bot.command("month", async (ctx) => {
   } catch (e) {
     console.error("MONTH_FAIL:", e);
     return ctx.reply("⚠️ حصل خطأ في تقرير الشهر. راجع Logs.");
+  }
+});
+
+// ✅ Set budget: /setbudget Food 300 [YYYY-MM]
+bot.command("setbudget", async (ctx) => {
+  try {
+    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
+    const uid = ctx.from.id;
+
+    const parts = (ctx.message?.text || "").trim().split(/\s+/);
+    const category = parts[1];
+    const amount = Number(parts[2]);
+    const month = (parts[3] || thisMonthKey()).trim();
+
+    if (!CATEGORIES.includes(category)) {
+      return ctx.reply(`❌ فئة غير صحيحة.\nاستخدم واحدة من:\n${CATEGORIES.join(", ")}`);
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return ctx.reply("❌ المبلغ لازم يكون رقم موجب.\nمثال: /setbudget Food 300");
+    }
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return ctx.reply("❌ صيغة الشهر غلط. استخدم YYYY-MM مثل: 2026-01");
+    }
+
+    await pool.query(
+      `insert into budgets (tg_user_id, month, category, amount, currency)
+       values ($1,$2,$3,$4,'SAR')
+       on conflict (tg_user_id, month, category)
+       do update set amount=excluded.amount, currency='SAR'`,
+      [uid, month, category, amount]
+    );
+
+    return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${amount.toFixed(2)} SAR`);
+  } catch (e) {
+    console.error("SETBUDGET_FAIL:", e);
+    return ctx.reply("⚠️ فشل ضبط الميزانية. راجع Logs.");
+  }
+});
+
+// ✅ View budgets for current month
+bot.command("budget", async (ctx) => {
+  try {
+    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
+    const uid = ctx.from.id;
+    const month = thisMonthKey();
+
+    const buds = await pool.query(
+      `select category, amount::numeric as budget
+       from budgets
+       where tg_user_id=$1 and month=$2
+       order by category asc`,
+      [uid, month]
+    );
+
+    if (!buds.rowCount) {
+      return ctx.reply(`ما في ميزانيات لشهر ${month}.\nاستخدم: /setbudget Food 300`);
+    }
+
+    // spent per category
+    const spent = await pool.query(
+      `select category, coalesce(sum(amount),0)::numeric as total
+       from tx
+       where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
+       group by category`,
+      [uid, month]
+    );
+    const spentMap = new Map(spent.rows.map((x) => [x.category, Number(x.total)]));
+
+    const lines = buds.rows.map((b) => {
+      const s = spentMap.get(b.category) || 0;
+      const bud = Number(b.budget);
+      const pct = bud > 0 ? Math.round((s / bud) * 100) : 0;
+      return `- ${b.category}: ${s.toFixed(2)} / ${bud.toFixed(2)} SAR (${pct}%)`;
+    });
+
+    return ctx.reply(`📌 ميزانيات شهر ${month}\n${lines.join("\n")}`);
+  } catch (e) {
+    console.error("BUDGET_FAIL:", e);
+    return ctx.reply("⚠️ فشل عرض الميزانيات. راجع Logs.");
   }
 });
 
@@ -280,7 +433,12 @@ bot.on("text", async (ctx) => {
     );
 
     const status = await saveTx(ctx.from.id, tx, text);
-    if (status === "OK") return ctx.reply("💾 تم الحفظ.");
+
+    if (status === "OK") {
+      await ctx.reply("💾 تم الحفظ.");
+      await checkBudgetAlerts(ctx, ctx.from.id, tx);
+      return;
+    }
     if (status === "NO_DB") return ctx.reply("ℹ️ DB غير مفعلة. أضف DATABASE_URL.");
     return ctx.reply("⚠️ فشل الحفظ في DB. شوف /env");
   } catch (e) {
@@ -290,22 +448,19 @@ bot.on("text", async (ctx) => {
 });
 
 // =====================
-// LAUNCH (STEP LOGS)
+// LAUNCH
 // =====================
 (async () => {
   try {
     await initDb();
 
-    console.log("STEP: before deleteWebhook");
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    console.log("STEP: after deleteWebhook, before getMe");
 
     const me = await bot.telegram.getMe();
-    console.log("STEP: getMe OK:", me.username);
+    console.log("BOT USERNAME:", me.username);
 
-    console.log("STEP: before launch");
     await bot.launch();
-    console.log("STEP: after launch (BOT READY)");
+    console.log("BOT READY");
   } catch (e) {
     console.error("LAUNCH FAILED:", e);
     process.exit(1);
