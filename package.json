@@ -1,58 +1,19 @@
 {
-  "name": "agent-stack-mastra",
+  "name": "samir-budget-bot",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "mastra dev",
-    "build": "mastra build",
-    "check": "tsc",
-    "check:format": "prettier --check '**/*.ts'",
-    "format": "prettier --write '**/*.ts'"
-  },
-  "keywords": [],
+  "private": true,
   "type": "module",
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=20"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^1.3.24",
-    "@inngest/realtime": "^0.3.1",
-    "@mastra/core": "^0.20.0",
-    "@mastra/inngest": "^0.16.0",
-    "@mastra/libsql": "^0.15.1",
-    "@mastra/loggers": "^0.10.15",
-    "@mastra/memory": "^0.15.5",
-    "@mastra/pg": "^0.17.1",
-    "@openrouter/ai-sdk-provider": "^0.4.6",
-    "@slack/web-api": "^7.9.3",
-    "@types/pdfkit": "^0.17.4",
-    "@types/pg": "^8.16.0",
-    "ai": "^4.3.16",
-    "dotenv": "^17.2.0",
-    "drizzle-zod": "^0.8.3",
-    "exa-js": "^1.8.17",
-    "inngest": "^3.40.2",
-    "inngest-cli": "^1.11.5",
-    "openai": "^6.16.0",
-    "p-limit": "^7.2.0",
-    "p-retry": "^7.1.1",
-    "pdfkit": "^0.17.2",
-    "pg": "^8.16.3",
-    "pino": "^9.9.4",
     "telegraf": "^4.16.3",
-    "tsx": "^4.20.3",
-    "zod": "^3.25.76",
-    "zod-validation-error": "^5.0.0"
-  },
-  "devDependencies": {
-    "@types/node": "^24.6.2",
-    "mastra": "^0.14.0",
-    "prettier": "^3.6.2",
-    "ts-node": "^10.9.1",
-    "typescript": "^5.9.3"
+    "openai": "^4.80.0",
+    "pg": "^8.16.3",
+    "zod": "^3.25.76"
   }
 }
