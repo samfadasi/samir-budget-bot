@@ -58,7 +58,6 @@ async function initDb() {
     DB_STATUS = "disabled";
     return;
   }
-
   try {
     pool = new Pool({
       connectionString: DATABASE_URL,
@@ -142,6 +141,9 @@ function safeNum(n, fallback = 0) {
 }
 function formatMoney(n) {
   return safeNum(n).toFixed(2);
+}
+function normalizeCell(v) {
+  return (v ?? "").toString().replace(/\s+/g, " ").trim();
 }
 
 // =====================
@@ -261,7 +263,7 @@ async function checkBudgetAlerts(ctx, tgUserId, tx) {
 }
 
 // =====================
-// PDF GENERATION (FIXED LAYOUT)
+// PDF GENERATION (NO OVERLAP, NO TRUNCATION)
 // =====================
 function collectPdfBuffer(doc) {
   return new Promise((resolve, reject) => {
@@ -281,52 +283,91 @@ function tryLogo(doc) {
   } catch (_) {}
 }
 
-// Hard-positioned header to prevent overlaps
-function header(doc, title, sub) {
+function drawHeader(doc, title, sub) {
   tryLogo(doc);
 
-  doc.fontSize(16).text(COMPANY_NAME, 110, 40, { lineGap: 2 });
-  doc.fontSize(14).text(title, 110, 62, { lineGap: 2 });
-  doc.fontSize(10).fillColor("#444").text(sub, 110, 84, { lineGap: 2 }).fillColor("#000");
+  doc.fontSize(16).text(COMPANY_NAME, 110, 40);
+  doc.fontSize(14).text(title, 110, 62);
+  doc.fontSize(10).fillColor("#444").text(sub, 110, 84).fillColor("#000");
 
   doc.moveTo(40, 118).lineTo(555, 118).stroke();
 
-  // Critical: set Y to a known safe position
+  // safe cursor
   doc.y = 140;
 }
 
-function table(doc, cols, rows) {
-  const startX = 40;
-  let y = doc.y;
-  const rowH = 18;
+function drawTableHeader(doc, cols, startX, y, headerH) {
   const totalW = cols.reduce((s, c) => s + c.w, 0);
-
-  // Header background
-  doc.rect(startX, y, totalW, rowH).fill("#f0f0f0");
+  doc.rect(startX, y, totalW, headerH).fill("#f0f0f0");
   doc.fillColor("#000").fontSize(10);
 
   let x = startX;
   for (const c of cols) {
-    doc.text(c.h, x + 4, y + 4, { width: c.w - 8 });
+    doc.text(c.h, x + 4, y + 6, { width: c.w - 8 });
     x += c.w;
   }
-  y += rowH;
+  return y + headerH;
+}
 
-  doc.fontSize(10).fillColor("#000");
-  for (const r of rows) {
-    if (y > 760) {
-      doc.addPage();
-      // reset top on new pages
-      y = 60;
-    }
+/**
+ * Dynamic-height table:
+ * - calculates row height based on the tallest cell (using heightOfString)
+ * - wraps text naturally inside the cell width
+ * - prevents overlaps by advancing Y correctly
+ */
+function drawTableDynamic(doc, cols, rows, options = {}) {
+  const startX = options.startX ?? 40;
+  const pageBottomY = options.pageBottomY ?? 780; // safe bottom
+  const headerH = options.headerH ?? 22;
+  const paddingX = options.paddingX ?? 4;
+  const paddingY = options.paddingY ?? 6;
+  const minRowH = options.minRowH ?? 20;
 
-    x = startX;
+  // set consistent font for measurement & drawing
+  doc.fontSize(10);
+
+  let y = options.startY ?? doc.y;
+
+  // draw first header
+  y = drawTableHeader(doc, cols, startX, y, headerH);
+
+  for (const row of rows) {
+    // measure row height
+    let rowH = minRowH;
     for (let i = 0; i < cols.length; i++) {
-      doc.rect(x, y, cols[i].w, rowH).strokeColor("#ddd").stroke();
-      doc.strokeColor("#000");
-      doc.text(String(r[i] ?? ""), x + 4, y + 4, { width: cols[i].w - 8 });
-      x += cols[i].w;
+      const text = normalizeCell(row[i]);
+      const w = cols[i].w - paddingX * 2;
+      const h = doc.heightOfString(text || " ", {
+        width: w,
+        align: "left",
+      });
+      const needed = h + paddingY * 2;
+      if (needed > rowH) rowH = needed;
     }
+
+    // page break with header repeat
+    if (y + rowH > pageBottomY) {
+      doc.addPage();
+      y = 60;
+      y = drawTableHeader(doc, cols, startX, y, headerH);
+    }
+
+    // draw row cells
+    let x = startX;
+    for (let i = 0; i < cols.length; i++) {
+      const w = cols[i].w;
+      doc.rect(x, y, w, rowH).strokeColor("#dddddd").stroke();
+      doc.strokeColor("#000000");
+
+      const text = normalizeCell(row[i]);
+      doc.text(text, x + paddingX, y + paddingY, {
+        width: w - paddingX * 2,
+        align: "left",
+      });
+
+      x += w;
+    }
+
     y += rowH;
   }
 
@@ -342,20 +383,21 @@ async function buildTodayPdf(tgUserId) {
      order by created_at desc`,
     [tgUserId, d]
   );
+
   const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  header(doc, "Daily Expense Report", `Date: ${d} | Currency: SAR`);
+  drawHeader(doc, "Daily Expense Report", `Date: ${d} | Currency: SAR`);
 
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`, { lineGap: 2 });
-  doc.y += 12; // hard spacing to prevent overlap
+  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`);
+  doc.y += 10;
 
   const cols = [
     { h: "Date", w: 70 },
     { h: "Amount", w: 80 },
     { h: "Category", w: 90 },
-    { h: "Vendor", w: 170 },
-    { h: "Notes", w: 145 },
+    { h: "Vendor", w: 160 },
+    { h: "Notes", w: 155 },
   ];
 
   const rows = r.rows.map((x) => [
@@ -366,8 +408,11 @@ async function buildTodayPdf(tgUserId) {
     x.description || "",
   ]);
 
-  if (!rows.length) doc.fontSize(12).text("No transactions found for today.");
-  else table(doc, cols, rows);
+  if (!rows.length) {
+    doc.fontSize(12).text("No transactions found for today.");
+  } else {
+    drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
+  }
 
   doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
@@ -394,27 +439,30 @@ async function buildMonthPdf(tgUserId, month) {
   const total = byCat.rows.reduce((s, x) => s + safeNum(x.total), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  header(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
+  drawHeader(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
 
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`, { lineGap: 2 });
+  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`);
   doc.y += 12;
 
   doc.fontSize(12).text("Summary by Category");
   doc.y += 8;
 
-  table(
-    doc,
-    [
-      { h: "Category", w: 260 },
-      { h: "Total (SAR)", w: 120 },
-      { h: "Share", w: 135 },
-    ],
-    byCat.rows.map((x) => {
-      const t = safeNum(x.total);
-      const pct = total > 0 ? `${Math.round((t / total) * 100)}%` : "0%";
-      return [x.category || "Uncategorized", formatMoney(t), pct];
-    })
-  );
+  const summaryCols = [
+    { h: "Category", w: 260 },
+    { h: "Total (SAR)", w: 120 },
+    { h: "Share", w: 135 },
+  ];
+  const summaryRows = byCat.rows.map((x) => {
+    const t = safeNum(x.total);
+    const pct = total > 0 ? `${Math.round((t / total) * 100)}%` : "0%";
+    return [x.category || "Uncategorized", formatMoney(t), pct];
+  });
+
+  if (summaryRows.length) {
+    drawTableDynamic(doc, summaryCols, summaryRows, { startY: doc.y, pageBottomY: 780 });
+  } else {
+    doc.fontSize(11).text("No summary data.");
+  }
 
   doc.fontSize(12).text("Detailed Transactions");
   doc.y += 8;
@@ -423,8 +471,8 @@ async function buildMonthPdf(tgUserId, month) {
     { h: "Date", w: 70 },
     { h: "Amount", w: 80 },
     { h: "Category", w: 90 },
-    { h: "Vendor", w: 170 },
-    { h: "Notes", w: 145 },
+    { h: "Vendor", w: 160 },
+    { h: "Notes", w: 155 },
   ];
 
   const rows = tx.rows.map((x) => [
@@ -435,34 +483,28 @@ async function buildMonthPdf(tgUserId, month) {
     x.description || "",
   ]);
 
-  if (!rows.length) doc.fontSize(12).text("No transactions found for this month.");
-  else table(doc, cols, rows);
+  if (!rows.length) {
+    doc.fontSize(12).text("No transactions found for this month.");
+  } else {
+    drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
+  }
 
   doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
 }
 
 // =====================
-// ERROR LOGGING
-// =====================
-bot.catch((e) => console.error("BOT ERROR:", e));
-process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
-
-console.log("BOOT: accounting-bot-clean-v2 (pdf layout fixed)");
-
-// =====================
 // COMMANDS
 // =====================
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v2"));
+bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v3-dynamic-pdf"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
     `openai: ${openai ? "yes" : "no"}\n` +
       `model: ${OPENAI_MODEL}\n` +
       `db: ${DB_STATUS}\n` +
-      (DB_ERROR ? `db_error: ${DB_ERROR.slice(0, 120)}` : "")
+      (DB_ERROR ? `db_error: ${DB_ERROR.slice(0, 180)}` : "")
   );
 });
 
@@ -750,13 +792,17 @@ bot.on("text", async (ctx) => {
     return ctx.reply("⚠️ فشل الحفظ في DB. شوف /env");
   } catch (e) {
     console.error("EXTRACT_FAIL:", e);
-    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: غداء 40 ريال مطعم رائد البخاري");
+    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: دفعت 25 ريال قهوة");
   }
 });
 
 // =====================
 // LAUNCH
 // =====================
+bot.catch((e) => console.error("BOT ERROR:", e));
+process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
+
 (async () => {
   try {
     await initDb();
