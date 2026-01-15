@@ -17,7 +17,7 @@ const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const COMPANY_NAME = (process.env.COMPANY_NAME || "Samir Budget Bot").trim();
-const LOGO_PATH = (process.env.LOGO_PATH || "").trim(); // e.g. "./assets/logo.png"
+const LOGO_PATH = (process.env.LOGO_PATH || "").trim(); // e.g. "attached_assets/logo.png"
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("FATAL: TELEGRAM_BOT_TOKEN missing");
@@ -67,7 +67,6 @@ async function initDb() {
 
     await pool.query("select 1");
 
-    // Transactions
     await pool.query(`
       create table if not exists tx (
         id bigserial primary key,
@@ -90,10 +89,7 @@ async function initDb() {
 
       create index if not exists idx_tx_user_month_cat
         on tx (tg_user_id, category, tx_date);
-    `);
 
-    // Budgets
-    await pool.query(`
       create table if not exists budgets (
         id bigserial primary key,
         tg_user_id bigint not null,
@@ -137,16 +133,13 @@ function thisMonthKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
-
 function safeNum(n, fallback = 0) {
   const x = Number(n);
   return Number.isFinite(x) ? x : fallback;
 }
-
 function formatMoney(n) {
   return safeNum(n).toFixed(2);
 }
-
 function ensureMonthFormat(m) {
   return /^\d{4}-\d{2}$/.test(m);
 }
@@ -206,7 +199,7 @@ async function extractExpense(text) {
 }
 
 // =====================
-// DB OPS
+// DB OPS + ALERTS
 // =====================
 async function saveTx(tgUserId, tx, rawText) {
   if (!pool) return "NO_DB";
@@ -275,88 +268,59 @@ function collectPdfBuffer(doc) {
   });
 }
 
-function drawHeader(doc, title, sub) {
-  const top = 40;
-
-  // Logo (optional)
+function tryLogo(doc) {
+  if (!LOGO_PATH) return;
   try {
-    if (LOGO_PATH) {
-      const abs = path.isAbsolute(LOGO_PATH) ? LOGO_PATH : path.join(process.cwd(), LOGO_PATH);
-      if (fs.existsSync(abs)) {
-        doc.image(abs, 40, top, { width: 60 });
-      }
-    }
-  } catch (e) {
-    // don't fail PDF for logo
-  }
-
-  doc
-    .fontSize(16)
-    .text(COMPANY_NAME, 110, top, { align: "left" })
-    .moveDown(0.2);
-
-  doc
-    .fontSize(14)
-    .text(title, 110, top + 22, { align: "left" })
-    .moveDown(0.2);
-
-  doc
-    .fontSize(10)
-    .fillColor("#444444")
-    .text(sub, 110, top + 42, { align: "left" })
-    .fillColor("#000000");
-
-  doc.moveTo(40, top + 75).lineTo(555, top + 75).stroke();
-  doc.moveDown(2);
+    const abs = path.isAbsolute(LOGO_PATH) ? LOGO_PATH : path.join(process.cwd(), LOGO_PATH);
+    if (fs.existsSync(abs)) doc.image(abs, 40, 40, { width: 60 });
+  } catch (_) {}
 }
 
-function drawTable(doc, columns, rows, options = {}) {
+function header(doc, title, sub) {
+  tryLogo(doc);
+  doc.fontSize(16).text(COMPANY_NAME, 110, 40);
+  doc.fontSize(14).text(title, 110, 62);
+  doc.fontSize(10).fillColor("#444").text(sub, 110, 82).fillColor("#000");
+  doc.moveTo(40, 110).lineTo(555, 110).stroke();
+  doc.y = 130;
+}
+
+function table(doc, cols, rows) {
   const startX = 40;
-  let y = options.startY || doc.y;
-  const rowH = options.rowH || 18;
+  let y = doc.y;
+  const rowH = 18;
+  const totalW = cols.reduce((s, c) => s + c.w, 0);
 
-  const colWidths = columns.map((c) => c.width);
-  const headers = columns.map((c) => c.header);
-
-  // Header background
-  doc.rect(startX, y, colWidths.reduce((a, b) => a + b, 0), rowH).fill("#f0f0f0");
-  doc.fillColor("#000000").fontSize(10);
+  // header bg
+  doc.rect(startX, y, totalW, rowH).fill("#f0f0f0");
+  doc.fillColor("#000").fontSize(10);
 
   let x = startX;
-  for (let i = 0; i < headers.length; i++) {
-    doc.text(headers[i], x + 4, y + 4, { width: colWidths[i] - 8, align: "left" });
-    x += colWidths[i];
+  for (const c of cols) {
+    doc.text(c.h, x + 4, y + 4, { width: c.w - 8 });
+    x += c.w;
   }
   y += rowH;
 
-  // Rows
-  doc.fontSize(10);
   for (const r of rows) {
-    // page break
     if (y > 760) {
       doc.addPage();
       y = 60;
     }
-
     x = startX;
-    for (let i = 0; i < columns.length; i++) {
-      doc.rect(x, y, colWidths[i], rowH).strokeColor("#dddddd").stroke();
-      doc.strokeColor("#000000");
-      doc.text(String(r[i] ?? ""), x + 4, y + 4, { width: colWidths[i] - 8, align: "left" });
-      x += colWidths[i];
+    for (let i = 0; i < cols.length; i++) {
+      doc.rect(x, y, cols[i].w, rowH).strokeColor("#ddd").stroke();
+      doc.strokeColor("#000");
+      doc.text(String(r[i] ?? ""), x + 4, y + 4, { width: cols[i].w - 8 });
+      x += cols[i].w;
     }
     y += rowH;
   }
-
-  doc.moveDown(1);
   doc.y = y + 10;
 }
 
 async function buildTodayPdf(tgUserId) {
-  if (!pool) throw new Error("DB not ready");
-
   const d = todayISO();
-
   const r = await pool.query(
     `select tx_date, amount::numeric as amount, currency, vendor, category, description
      from tx
@@ -364,50 +328,36 @@ async function buildTodayPdf(tgUserId) {
      order by created_at desc`,
     [tgUserId, d]
   );
-
   const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  drawHeader(doc, "Daily Expense Report", `Date: ${d}   |   Currency: SAR`);
+  header(doc, "Daily Expense Report", `Date: ${d} | Currency: SAR`);
+  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`).moveDown(0.8);
 
-  doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`).moveDown(0.6);
-
-  const columns = [
-    { header: "Date", width: 70 },
-    { header: "Amount", width: 70 },
-    { header: "Category", width: 90 },
-    { header: "Vendor", width: 170 },
-    { header: "Notes", width: 155 },
+  const cols = [
+    { h: "Date", w: 70 },
+    { h: "Amount", w: 70 },
+    { h: "Category", w: 90 },
+    { h: "Vendor", w: 170 },
+    { h: "Notes", w: 155 },
   ];
-
   const rows = r.rows.map((x) => [
-    String(x.tx_date || d),
+    x.tx_date,
     `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
     x.category || "",
     x.vendor || "",
     x.description || "",
   ]);
 
-  if (!rows.length) {
-    doc.fontSize(12).text("No transactions found for today.");
-  } else {
-    drawTable(doc, columns, rows);
-  }
+  if (!rows.length) doc.fontSize(12).text("No transactions found for today.");
+  else table(doc, cols, rows);
 
-  doc
-    .fontSize(9)
-    .fillColor("#444444")
-    .text(`Generated by ${COMPANY_NAME} • ${new Date().toISOString()}`, { align: "left" })
-    .fillColor("#000000");
-
+  doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
 }
 
 async function buildMonthPdf(tgUserId, month) {
-  if (!pool) throw new Error("DB not ready");
-  if (!ensureMonthFormat(month)) throw new Error("Bad month format");
-
-  const r = await pool.query(
+  const tx = await pool.query(
     `select tx_date, amount::numeric as amount, currency, vendor, category, description
      from tx
      where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
@@ -427,97 +377,52 @@ async function buildMonthPdf(tgUserId, month) {
   const total = byCat.rows.reduce((s, x) => s + safeNum(x.total), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  drawHeader(doc, "Monthly Expense Report", `Month: ${month}   |   Currency: SAR`);
-
+  header(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
   doc.fontSize(11).text(`Total: ${formatMoney(total)} SAR`).moveDown(0.8);
 
-  // Summary table
   doc.fontSize(12).text("Summary by Category").moveDown(0.4);
-  drawTable(
+  table(
     doc,
     [
-      { header: "Category", width: 260 },
-      { header: "Total (SAR)", width: 120 },
-      { header: "Share", width: 135 },
+      { h: "Category", w: 260 },
+      { h: "Total (SAR)", w: 120 },
+      { h: "Share", w: 135 },
     ],
     byCat.rows.map((x) => {
       const t = safeNum(x.total);
       const pct = total > 0 ? `${Math.round((t / total) * 100)}%` : "0%";
       return [x.category || "Uncategorized", formatMoney(t), pct];
-    }),
-    { startY: doc.y }
+    })
   );
 
-  // Detailed table
   doc.fontSize(12).text("Detailed Transactions").moveDown(0.4);
-
-  const columns = [
-    { header: "Date", width: 70 },
-    { header: "Amount", width: 70 },
-    { header: "Category", width: 90 },
-    { header: "Vendor", width: 170 },
-    { header: "Notes", width: 155 },
+  const cols = [
+    { h: "Date", w: 70 },
+    { h: "Amount", w: 70 },
+    { h: "Category", w: 90 },
+    { h: "Vendor", w: 170 },
+    { h: "Notes", w: 155 },
   ];
-
-  const rows = r.rows.map((x) => [
-    String(x.tx_date || ""),
+  const rows = tx.rows.map((x) => [
+    x.tx_date,
     `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
     x.category || "",
     x.vendor || "",
     x.description || "",
   ]);
 
-  if (!rows.length) {
-    doc.fontSize(12).text("No transactions found for this month.");
-  } else {
-    drawTable(doc, columns, rows);
-  }
+  if (!rows.length) doc.fontSize(12).text("No transactions found for this month.");
+  else table(doc, cols, rows);
 
-  doc
-    .fontSize(9)
-    .fillColor("#444444")
-    .text(`Generated by ${COMPANY_NAME} • ${new Date().toISOString()}`, { align: "left" })
-    .fillColor("#000000");
-
+  doc.fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
   return await collectPdfBuffer(doc);
 }
 
 // =====================
-// ERROR LOGGING
+// COMMANDS + HANDLERS
 // =====================
-bot.catch((e) => console.error("BOT ERROR:", e));
-process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
-
-console.log("BOOT: accounting-bot v5 (budgets + pdf)");
-
-// =====================
-// COMMANDS
-// =====================
-bot.command("start", (ctx) =>
-  ctx.reply(
-    "✅ شغال.\n" +
-      "أرسل مصروف مثل: دفعت 40 ريال للغداء من مطعم...\n\n" +
-      "تقارير:\n" +
-      "/today\n" +
-      "/month\n" +
-      "/last 10\n" +
-      "/sum Food\n\n" +
-      "ميزانيات:\n" +
-      "/setbudget Food 300\n" +
-      "/budget\n\n" +
-      "PDF:\n" +
-      "/exportpdf today\n" +
-      "/exportpdf month\n\n" +
-      "تصحيح:\n" +
-      "/del last\n\n" +
-      "تشخيص:\n" +
-      "/ping /env /version"
-  )
-);
-
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: accounting-bot-v5"));
+bot.command("version", (ctx) => ctx.reply("version: accounting-bot-clean-v1"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
@@ -528,7 +433,18 @@ bot.command("env", (ctx) => {
   );
 });
 
-// /today
+bot.command("start", (ctx) =>
+  ctx.reply(
+    "✅ شغال.\n" +
+      "سجّل مصروف: دفعت 40 ريال للغداء من مطعم...\n\n" +
+      "تقارير: /today /month /last 10 /sum Food\n" +
+      "ميزانيات: /setbudget Food 300 /budget\n" +
+      "PDF: /exportpdf today | /exportpdf month [YYYY-MM]\n" +
+      "تصحيح: /del last\n" +
+      "تشخيص: /ping /env /version"
+  )
+);
+
 bot.command("today", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -547,9 +463,7 @@ bot.command("today", async (ctx) => {
     if (!r.rowCount) return ctx.reply("اليوم ما في مصروفات.");
 
     const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
-    const lines = r.rows
-      .map((x) => `- ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`)
-      .join("\n");
+    const lines = r.rows.map((x) => `- ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`).join("\n");
 
     return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
@@ -558,7 +472,6 @@ bot.command("today", async (ctx) => {
   }
 });
 
-// /month
 bot.command("month", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -582,16 +495,14 @@ bot.command("month", async (ctx) => {
     return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
     console.error("MONTH_FAIL:", e);
-    return ctx.reply("⚠️ حصل خطأ في تقرير الشهر. راجع Logs.");
+    return ctx.reply("⚠️ خطأ في تقرير الشهر. راجع Logs.");
   }
 });
 
-// /last 10
 bot.command("last", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
     const uid = ctx.from.id;
-
     const parts = (ctx.message?.text || "").trim().split(/\s+/);
     const n = Math.min(Math.max(Number(parts[1] || 10), 1), 50);
 
@@ -617,7 +528,6 @@ bot.command("last", async (ctx) => {
   }
 });
 
-// /sum Food [YYYY-MM]
 bot.command("sum", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -644,7 +554,6 @@ bot.command("sum", async (ctx) => {
   }
 });
 
-// /setbudget Food 300 [YYYY-MM]
 bot.command("setbudget", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -680,7 +589,6 @@ bot.command("setbudget", async (ctx) => {
   }
 });
 
-// /budget
 bot.command("budget", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -695,9 +603,7 @@ bot.command("budget", async (ctx) => {
       [uid, month]
     );
 
-    if (!buds.rowCount) {
-      return ctx.reply(`ما في ميزانيات لشهر ${month}.\nاستخدم: /setbudget Food 300`);
-    }
+    if (!buds.rowCount) return ctx.reply(`ما في ميزانيات لشهر ${month}.\nاستخدم: /setbudget Food 300`);
 
     const spent = await pool.query(
       `select category, coalesce(sum(amount),0)::numeric as total
@@ -706,6 +612,7 @@ bot.command("budget", async (ctx) => {
        group by category`,
       [uid, month]
     );
+
     const spentMap = new Map(spent.rows.map((x) => [x.category, safeNum(x.total)]));
 
     const lines = buds.rows.map((b) => {
@@ -722,16 +629,13 @@ bot.command("budget", async (ctx) => {
   }
 });
 
-// /del last  (delete last tx)
 bot.command("del", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
     const uid = ctx.from.id;
 
     const parts = (ctx.message?.text || "").trim().split(/\s+/);
-    if ((parts[1] || "").toLowerCase() !== "last") {
-      return ctx.reply("استخدم: /del last");
-    }
+    if ((parts[1] || "").toLowerCase() !== "last") return ctx.reply("استخدم: /del last");
 
     const r = await pool.query(
       `delete from tx
@@ -748,17 +652,13 @@ bot.command("del", async (ctx) => {
     if (!r.rowCount) return ctx.reply("ما في عمليات للحذف.");
 
     const x = r.rows[0];
-    return ctx.reply(
-      `🗑️ تم حذف آخر عملية:\n` +
-        `${x.tx_date} | ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`
-    );
+    return ctx.reply(`🗑️ تم حذف آخر عملية:\n${x.tx_date} | ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`);
   } catch (e) {
     console.error("DEL_FAIL:", e);
     return ctx.reply("⚠️ فشل الحذف. راجع Logs.");
   }
 });
 
-// /exportpdf today | month [YYYY-MM]
 bot.command("exportpdf", async (ctx) => {
   try {
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
@@ -766,8 +666,6 @@ bot.command("exportpdf", async (ctx) => {
 
     const parts = (ctx.message?.text || "").trim().split(/\s+/);
     const mode = (parts[1] || "").toLowerCase();
-
-    if (!mode) return ctx.reply("استخدم: /exportpdf today أو /exportpdf month أو /exportpdf month 2026-01");
 
     if (mode === "today") {
       const buf = await buildTodayPdf(uid);
@@ -781,16 +679,14 @@ bot.command("exportpdf", async (ctx) => {
       return ctx.replyWithDocument({ source: buf, filename: `monthly-report-${m}.pdf` });
     }
 
-    return ctx.reply("استخدم: /exportpdf today أو /exportpdf month");
+    return ctx.reply("استخدم: /exportpdf today أو /exportpdf month أو /exportpdf month 2026-01");
   } catch (e) {
     console.error("EXPORTPDF_FAIL:", e);
     return ctx.reply("⚠️ فشل تصدير PDF. راجع Logs.");
   }
 });
 
-// =====================
-// MAIN HANDLER (expense message)
-// =====================
+// Expense message
 bot.on("text", async (ctx) => {
   const text = (ctx.message?.text || "").trim();
   if (!text || text.startsWith("/")) return;
@@ -821,7 +717,7 @@ bot.on("text", async (ctx) => {
     return ctx.reply("⚠️ فشل الحفظ في DB. شوف /env");
   } catch (e) {
     console.error("EXTRACT_FAIL:", e);
-    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: غداء 40 ريال مطعم رائد البخخاري");
+    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: غداء 40 ريال مطعم رائد البخاري");
   }
 });
 
@@ -831,7 +727,6 @@ bot.on("text", async (ctx) => {
 (async () => {
   try {
     await initDb();
-
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
     const me = await bot.telegram.getMe();
