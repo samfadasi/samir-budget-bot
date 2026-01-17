@@ -53,6 +53,8 @@ let pool = null;
 let DB_STATUS = "disabled";
 let DB_ERROR = "";
 
+let LAST_ERROR = "";
+
 function setDbError(e) {
   DB_ERROR = String(e?.stack || e?.message || e);
   console.error("[DB]", DB_ERROR);
@@ -201,9 +203,9 @@ async function extractExpenseFromText(text) {
 }
 
 // =====================
-// AI Extract (Receipt Image)
+// AI Extract (Receipt Image URL)
 // =====================
-async function extractExpenseFromImageDataUrl(dataUrl) {
+async function extractExpenseFromImageUrl(imageUrl) {
   if (!openai) throw new Error("OpenAI disabled");
   const today = todayISO();
 
@@ -234,10 +236,7 @@ async function extractExpenseFromImageDataUrl(dataUrl) {
               `Description = short.\n` +
               `Return JSON only.`,
           },
-          {
-            type: "image_url",
-            image_url: { url: dataUrl },
-          },
+          { type: "image_url", image_url: { url: imageUrl } },
         ],
       },
     ],
@@ -350,7 +349,7 @@ async function checkBudgetAlerts(ctx, tgUserId, tx) {
 }
 
 // =====================
-// PDF (Arabic via Cairo)
+// PDF (Arabic via Cairo only)
 // =====================
 function registerArabicFont(doc) {
   try {
@@ -360,10 +359,17 @@ function registerArabicFont(doc) {
 }
 
 function fontForText(doc, text) {
-  // basic arabic detection
   const isAr = /[\u0600-\u06FF]/.test(text || "");
-  if (isAr && doc._registeredFonts?.AR) return doc.font("AR");
-  return doc.font("Helvetica");
+  // pdfkit stores fonts internally; when registered, it can be used by name safely
+  if (isAr) {
+    try {
+      doc.font("AR");
+      return;
+    } catch (_) {
+      // fall back
+    }
+  }
+  doc.font("Helvetica");
 }
 
 function collectPdfBuffer(doc) {
@@ -530,6 +536,11 @@ async function buildMonthPdf(tgUserId, month) {
 // =====================
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
 
+bot.command("last_error", (ctx) => {
+  if (!LAST_ERROR) return ctx.reply("no");
+  return ctx.reply(LAST_ERROR.slice(0, 3500));
+});
+
 bot.command("env", (ctx) => {
   ctx.reply(
     `openai: ${openai ? "yes" : "no"}\n` +
@@ -552,7 +563,8 @@ bot.command("start", (ctx) => {
       "/setbudget Food 300\n" +
       "/budget\n" +
       "/exportpdf month\n" +
-      "/env"
+      "/env\n" +
+      "/last_error"
   );
 });
 
@@ -578,8 +590,9 @@ bot.command("today", async (ctx) => {
 
     return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("TODAY_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في تقرير اليوم.");
+    return ctx.reply("⚠️ خطأ في تقرير اليوم. اكتب /last_error");
   }
 });
 
@@ -605,8 +618,9 @@ bot.command("month", async (ctx) => {
 
     return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("MONTH_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في تقرير الشهر.");
+    return ctx.reply("⚠️ خطأ في تقرير الشهر. اكتب /last_error");
   }
 });
 
@@ -633,8 +647,9 @@ bot.command("setbudget", async (ctx) => {
     await setBudget(uid, month, category, amount);
     return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${formatMoney(amount)} SAR`);
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("SETBUDGET_FAIL:", e);
-    return ctx.reply("⚠️ فشل ضبط الميزانية.");
+    return ctx.reply("⚠️ فشل ضبط الميزانية. اكتب /last_error");
   }
 });
 
@@ -650,8 +665,9 @@ bot.command("budget", async (ctx) => {
     const lines = rows.map((x) => `- ${x.category}: ${formatMoney(x.spent)} / ${formatMoney(x.budget)} SAR (${x.pct}%)`);
     return ctx.reply(`📌 ميزانيات شهر ${month}\n${lines.join("\n")}`);
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("BUDGET_FAIL:", e);
-    return ctx.reply("⚠️ فشل عرض الميزانيات.");
+    return ctx.reply("⚠️ فشل عرض الميزانيات. اكتب /last_error");
   }
 });
 
@@ -671,8 +687,9 @@ bot.command("exportpdf", async (ctx) => {
     const buf = await buildMonthPdf(uid, m);
     return ctx.replyWithDocument({ source: buf, filename: `monthly-report-${m}.pdf` });
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("EXPORTPDF_FAIL:", e);
-    return ctx.reply("⚠️ فشل تصدير PDF.");
+    return ctx.reply("⚠️ فشل تصدير PDF. اكتب /last_error");
   }
 });
 
@@ -686,6 +703,7 @@ bot.on("text", async (ctx) => {
   if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
 
   try {
+    LAST_ERROR = "";
     const tx = await extractExpenseFromText(text);
 
     await ctx.reply(
@@ -706,36 +724,34 @@ bot.on("text", async (ctx) => {
     if (status === "NO_DB") return ctx.reply("ℹ️ DB غير مفعلة. أضف DATABASE_URL.");
     return ctx.reply("⚠️ فشل الحفظ في DB. شوف /env");
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("TEXT_EXTRACT_FAIL:", e);
     return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: غداء 40 ريال مطعم رائد البخاري");
   }
 });
 
 // =====================
-// PHOTO receipt expense
+// PHOTO receipt expense (FIXED: use Telegram URL, no base64)
 // =====================
 bot.on("photo", async (ctx) => {
   try {
+    LAST_ERROR = "";
     if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
 
     const photos = ctx.message?.photo || [];
-    const best = photos[photos.length - 1];
-    if (!best?.file_id) return ctx.reply("❌ ما لقيت صورة واضحة.");
+    if (!photos.length) return ctx.reply("❌ ما لقيت صورة.");
+
+    // pick medium size to avoid huge images
+    const pick = photos[Math.floor(photos.length / 2)];
+    if (!pick?.file_id) return ctx.reply("❌ ما لقيت file_id.");
 
     await ctx.reply("⏳ جاري قراءة الفاتورة...");
 
-    // Telegram file link -> download -> data URL
-    const link = await ctx.telegram.getFileLink(best.file_id);
-    const resp = await fetch(link.href);
-    if (!resp.ok) throw new Error(`Failed to download image: ${resp.status}`);
+    const link = await ctx.telegram.getFileLink(pick.file_id);
+    const imageUrl = link.href;
 
-    const contentType = resp.headers.get("content-type") || "image/jpeg";
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const b64 = buf.toString("base64");
-    const dataUrl = `data:${contentType};base64,${b64}`;
-
-    const tx = await extractExpenseFromImageDataUrl(dataUrl);
+    const tx = await extractExpenseFromImageUrl(imageUrl);
 
     await ctx.reply(
       `✅ تم استخراج الفاتورة:\n` +
@@ -746,7 +762,7 @@ bot.on("photo", async (ctx) => {
         `📝 ${tx.description || "-"}`
     );
 
-    const status = await saveTx(ctx.from.id, tx, "RECEIPT_IMAGE", "IMAGE");
+    const status = await saveTx(ctx.from.id, tx, "RECEIPT_IMAGE_URL", "IMAGE");
     if (status === "OK") {
       await ctx.reply("💾 تم الحفظ.");
       await checkBudgetAlerts(ctx, ctx.from.id, tx);
@@ -754,8 +770,9 @@ bot.on("photo", async (ctx) => {
     }
     return ctx.reply("⚠️ تم الاستخراج لكن فشل الحفظ في DB. شوف /env");
   } catch (e) {
+    LAST_ERROR = String(e?.stack || e?.message || e);
     console.error("PHOTO_RECEIPT_FAIL:", e);
-    return ctx.reply("⚠️ ما قدرت أقرأ الفاتورة. جرّب صورة أوضح (بدون قص) وبإضاءة كويسة.");
+    return ctx.reply("⚠️ فشل قراءة الفاتورة. اكتب /last_error لعرض سبب الخطأ.");
   }
 });
 
