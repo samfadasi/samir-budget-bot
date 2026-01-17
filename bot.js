@@ -40,6 +40,7 @@ http
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
+// ignore updates without user
 bot.use((ctx, next) => {
   if (!ctx.from) return;
   return next();
@@ -51,21 +52,36 @@ bot.use((ctx, next) => {
 let pool = null;
 let DB_STATUS = "disabled";
 let DB_ERROR = "";
-let LAST_ERROR = "";
 
 function setDbError(e) {
   DB_ERROR = String(e?.stack || e?.message || e);
   console.error("[DB]", DB_ERROR);
 }
 
-async function ensureColumns() {
-  // migrations for existing installs
-  // idempotent: safe to re-run
+async function ensureSchema() {
+  // base tx
+  await pool.query(`
+    create table if not exists tx (
+      id bigserial primary key,
+      tg_user_id bigint not null,
+      tx_date date not null,
+      amount numeric(12,2) not null,
+      currency text not null default 'SAR',
+      vendor text,
+      category text,
+      description text
+    );
+  `);
+
+  // migrations for older installs (idempotent)
   await pool.query(`alter table tx add column if not exists raw_text text;`);
   await pool.query(`alter table tx add column if not exists source text;`);
   await pool.query(`alter table tx add column if not exists created_at timestamptz not null default now();`);
 
-  // ensure budgets table exists
+  await pool.query(`create index if not exists idx_tx_user_date on tx (tg_user_id, tx_date);`);
+  await pool.query(`create index if not exists idx_tx_user_created on tx (tg_user_id, created_at desc);`);
+
+  // budgets
   await pool.query(`
     create table if not exists budgets (
       id bigserial primary key,
@@ -76,6 +92,15 @@ async function ensureColumns() {
       currency text not null default 'SAR',
       created_at timestamptz not null default now(),
       unique (tg_user_id, month, category)
+    );
+  `);
+
+  // persistent bot state (last error)
+  await pool.query(`
+    create table if not exists bot_state (
+      tg_user_id bigint primary key,
+      last_error text,
+      updated_at timestamptz not null default now()
     );
   `);
 }
@@ -91,26 +116,7 @@ async function initDb() {
       ssl: { rejectUnauthorized: false },
     });
     await pool.query("select 1");
-
-    // base tables (create if not exists)
-    await pool.query(`
-      create table if not exists tx (
-        id bigserial primary key,
-        tg_user_id bigint not null,
-        tx_date date not null,
-        amount numeric(12,2) not null,
-        currency text not null default 'SAR',
-        vendor text,
-        category text,
-        description text
-      );
-
-      create index if not exists idx_tx_user_date on tx (tg_user_id, tx_date);
-      create index if not exists idx_tx_user_created on tx (tg_user_id, created_at desc);
-    `);
-
-    // migrate columns safely
-    await ensureColumns();
+    await ensureSchema();
 
     DB_STATUS = "enabled";
     console.log("DB READY");
@@ -119,6 +125,29 @@ async function initDb() {
     DB_STATUS = "error";
     setDbError(e);
   }
+}
+
+async function setLastError(tgUserId, message) {
+  try {
+    if (!pool) return;
+    const msg = String(message || "").slice(0, 8000);
+    await pool.query(
+      `insert into bot_state (tg_user_id, last_error, updated_at)
+       values ($1,$2,now())
+       on conflict (tg_user_id)
+       do update set last_error=excluded.last_error, updated_at=excluded.updated_at`,
+      [tgUserId, msg]
+    );
+  } catch (e) {
+    // do not crash on error logging
+    console.error("setLastError failed:", e);
+  }
+}
+
+async function getLastError(tgUserId) {
+  if (!pool) return "";
+  const r = await pool.query(`select last_error from bot_state where tg_user_id=$1`, [tgUserId]);
+  return r.rowCount ? String(r.rows[0].last_error || "") : "";
 }
 
 // =====================
@@ -144,6 +173,11 @@ const thisMonthKey = () => {
 const ensureMonthFormat = (m) => /^\d{4}-\d{2}$/.test(m);
 const safeNum = (n, fb = 0) => (Number.isFinite(Number(n)) ? Number(n) : fb);
 const money = (n) => safeNum(n).toFixed(2);
+
+function shortErr(e) {
+  const s = String(e?.message || e || "");
+  return s.length > 180 ? s.slice(0, 180) + "..." : s;
+}
 
 // =====================
 // AI Extract (Text)
@@ -253,17 +287,11 @@ async function extractFromImageUrl(imageUrl) {
 // =====================
 async function saveTx(uid, tx, rawText, source) {
   if (!pool) throw new Error("DB not initialized");
-  try {
-    await pool.query(
-      `insert into tx (tg_user_id, tx_date, amount, currency, vendor, category, description, raw_text, source)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [uid, tx.tx_date, tx.amount, tx.currency, tx.vendor, tx.category, tx.description, rawText, source]
-    );
-    return "OK";
-  } catch (e) {
-    setDbError(e);
-    throw e;
-  }
+  await pool.query(
+    `insert into tx (tg_user_id, tx_date, amount, currency, vendor, category, description, raw_text, source)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [uid, tx.tx_date, tx.amount, tx.currency, tx.vendor, tx.category, tx.description, rawText, source]
+  );
 }
 
 async function setBudget(uid, month, category, amount) {
@@ -380,7 +408,6 @@ function drawTable(doc, cols, rows) {
 
   for (const row of rows) {
     let rowH = minRowH;
-
     for (let i = 0; i < cols.length; i++) {
       const cell = String(row[i] ?? "").replace(/\s+/g, " ").trim();
       const w = cols[i].w - paddingX * 2;
@@ -391,7 +418,6 @@ function drawTable(doc, cols, rows) {
     if (y + rowH > pageBottomY) {
       doc.addPage();
       y = 60;
-
       doc.rect(startX, y, totalW, headerH).fill("#f0f0f0");
       doc.fillColor("#000").fontSize(10).font("Helvetica");
       x = startX;
@@ -495,7 +521,15 @@ bot.command("env", (ctx) => {
   );
 });
 
-bot.command("last_error", (ctx) => ctx.reply(LAST_ERROR || "no"));
+bot.command("last_error", async (ctx) => {
+  try {
+    if (!pool) return ctx.reply("no (db disabled)");
+    const msg = await getLastError(ctx.from.id);
+    return ctx.reply(msg || "no");
+  } catch (e) {
+    return ctx.reply("no");
+  }
+});
 
 bot.command("today", async (ctx) => {
   try {
@@ -515,7 +549,7 @@ bot.command("today", async (ctx) => {
     const lines = r.rows.map((x) => `- ${money(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`).join("\n");
     return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${money(total)} SAR`);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
     return ctx.reply("⚠️ خطأ في تقرير اليوم. /last_error");
   }
 });
@@ -538,7 +572,7 @@ bot.command("month", async (ctx) => {
     const lines = r.rows.map((x) => `- ${x.category}: ${money(x.total)} SAR`).join("\n");
     return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${money(total)} SAR`);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
     return ctx.reply("⚠️ خطأ في تقرير الشهر. /last_error");
   }
 });
@@ -559,7 +593,7 @@ bot.command("setbudget", async (ctx) => {
     await setBudget(uid, month, category, amount);
     return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${money(amount)} SAR`);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
     return ctx.reply("⚠️ فشل ضبط الميزانية. /last_error");
   }
 });
@@ -574,7 +608,7 @@ bot.command("budget", async (ctx) => {
     const lines = rows.map((x) => `- ${x.category}: ${money(x.spent)} / ${money(x.budget)} SAR (${x.pct}%)`);
     return ctx.reply(`📌 ميزانيات شهر ${month}\n${lines.join("\n")}`);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
     return ctx.reply("⚠️ فشل عرض الميزانيات. /last_error");
   }
 });
@@ -592,7 +626,7 @@ bot.command("exportpdf", async (ctx) => {
     const buf = await buildMonthPdf(uid, m);
     return ctx.replyWithDocument({ source: buf, filename: `monthly-report-${m}.pdf` });
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
     return ctx.reply("⚠️ فشل تصدير PDF. /last_error");
   }
 });
@@ -606,7 +640,6 @@ bot.on("text", async (ctx) => {
   if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
 
   try {
-    LAST_ERROR = "";
     const tx = await extractFromText(text);
 
     await ctx.reply(
@@ -622,17 +655,16 @@ bot.on("text", async (ctx) => {
     await ctx.reply("💾 تم الحفظ.");
     await checkBudgetAlerts(ctx, ctx.from.id, tx);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
-    return ctx.reply("❌ فشل الحفظ/الاستخراج. /last_error");
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
+    return ctx.reply(`❌ فشل الحفظ/الاستخراج. السبب: ${shortErr(e)}\nاكتب /last_error للتفاصيل.`);
   }
 });
 
 // =====================
-// PHOTO receipt expense
+// PHOTO receipt expense (Telegram URL)
 // =====================
 bot.on("photo", async (ctx) => {
   try {
-    LAST_ERROR = "";
     if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
     if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
 
@@ -658,8 +690,8 @@ bot.on("photo", async (ctx) => {
     await ctx.reply("💾 تم الحفظ.");
     await checkBudgetAlerts(ctx, ctx.from.id, tx);
   } catch (e) {
-    LAST_ERROR = String(e?.stack || e?.message || e);
-    return ctx.reply("⚠️ فشل قراءة/حفظ الفاتورة. /last_error");
+    await setLastError(ctx.from.id, e?.stack || e?.message || e);
+    return ctx.reply(`⚠️ فشل قراءة/حفظ الفاتورة. السبب: ${shortErr(e)}\nاكتب /last_error للتفاصيل.`);
   }
 });
 
