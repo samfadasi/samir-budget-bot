@@ -2,9 +2,9 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import PDFDocument from "pdfkit";
-import OpenAI from "openai";
 import pg from "pg";
 import { Telegraf } from "telegraf";
+import OpenAI from "openai";
 
 const { Pool } = pg;
 
@@ -15,10 +15,8 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
-
-const COMPANY_NAME = (process.env.COMPANY_NAME || "Samir Budget Bot").trim();
 const AR_FONT_PATH = (process.env.AR_FONT_PATH || "assets/fonts/Cairo-Regular.ttf").trim();
-const CURRENCY_DEFAULT = (process.env.CURRENCY_DEFAULT || "SAR").trim();
+const COMPANY_NAME = (process.env.COMPANY_NAME || "Samir Budget Bot").trim();
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("FATAL: TELEGRAM_BOT_TOKEN missing");
@@ -26,7 +24,7 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 
 // =====================
-// KEEP-ALIVE HTTP (Railway friendly)
+// Keep-alive HTTP (Railway)
 // =====================
 const PORT = Number(process.env.PORT || 3000);
 http
@@ -37,12 +35,12 @@ http
   .listen(PORT, () => console.log("HTTP OK on port", PORT));
 
 // =====================
-// BOT + OPENAI
+// Bot + OpenAI
 // =====================
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
-// Avoid crash on updates without user (channel/system updates)
+// avoid crashes on updates without user (channels/system updates)
 bot.use((ctx, next) => {
   if (!ctx.from) return;
   return next();
@@ -70,7 +68,6 @@ async function initDb() {
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false },
     });
-
     await pool.query("select 1");
 
     await pool.query(`
@@ -79,11 +76,12 @@ async function initDb() {
         tg_user_id bigint not null,
         tx_date date not null,
         amount numeric(12,2) not null,
-        currency text not null default '${CURRENCY_DEFAULT}',
+        currency text not null default 'SAR',
         vendor text,
         category text,
         description text,
         raw_text text,
+        source text,
         created_at timestamptz not null default now()
       );
 
@@ -96,7 +94,7 @@ async function initDb() {
         month text not null, -- YYYY-MM
         category text not null,
         amount numeric(12,2) not null,
-        currency text not null default '${CURRENCY_DEFAULT}',
+        currency text not null default 'SAR',
         created_at timestamptz not null default now(),
         unique (tg_user_id, month, category)
       );
@@ -106,13 +104,13 @@ async function initDb() {
     console.log("DB READY");
   } catch (e) {
     DB_STATUS = "error";
-    setDbError(e);
     pool = null;
+    setDbError(e);
   }
 }
 
 // =====================
-// CONSTANTS / HELPERS
+// Helpers
 // =====================
 const CATEGORIES = [
   "Food",
@@ -143,25 +141,11 @@ function safeNum(n, fallback = 0) {
 function formatMoney(n) {
   return safeNum(n).toFixed(2);
 }
-function normalizeCell(v) {
-  return (v ?? "").toString().replace(/\s+/g, " ").trim();
-}
-function hasArabic(text) {
-  return /[\u0600-\u06FF]/.test(text || "");
-}
-function fmtDate(v) {
-  // We want YYYY-MM-DD only (no 00:00:00)
-  if (!v) return "";
-  if (typeof v === "string") return v.slice(0, 10);
-  const d = new Date(v);
-  if (Number.isNaN(d.getTime())) return String(v).slice(0, 10);
-  return d.toISOString().slice(0, 10);
-}
 
 // =====================
-// AI EXTRACT (STRICT JSON)
+// AI Extract (Text)
 // =====================
-async function extractExpense(text) {
+async function extractExpenseFromText(text) {
   if (!openai) throw new Error("OpenAI disabled");
 
   const today = todayISO();
@@ -184,7 +168,7 @@ async function extractExpense(text) {
           `Extract ONE expense from Arabic/English:\n` +
           `"${text}"\n\n` +
           `Rules:\n` +
-          `- "ريال" or "ر.س" means SAR.\n` +
+          `- "ريال" means SAR.\n` +
           `- Meals/restaurant/coffee (غداء/عشاء/فطور/مطعم/قهوة) => category Food.\n` +
           `- If date missing => today.\n` +
           `Return JSON only.`,
@@ -192,37 +176,107 @@ async function extractExpense(text) {
     ],
   });
 
-  const out = res.choices?.[0]?.message?.content?.trim() || "{}";
-  const obj = JSON.parse(out);
+  const raw = res.choices?.[0]?.message?.content?.trim() || "{}";
+  const obj = JSON.parse(raw);
 
   const amount = Number(obj.amount);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid amount");
 
   const tx_date = String(obj.tx_date || today).slice(0, 10);
 
-  let currency = String(obj.currency || CURRENCY_DEFAULT).trim().toUpperCase();
+  let currency = String(obj.currency || "SAR").trim().toUpperCase();
   if (/(ريال|ر\.?س)/i.test(text) || currency === "ريال" || currency === "SR") currency = "SAR";
-
-  const vendor = String(obj.vendor || "Unknown").trim() || "Unknown";
 
   let category = String(obj.category || "Uncategorized").trim() || "Uncategorized";
   if (!CATEGORIES.includes(category)) category = "Uncategorized";
 
-  const description = String(obj.description || "").trim();
-
-  return { tx_date, amount, currency, vendor, category, description };
+  return {
+    tx_date,
+    amount,
+    currency,
+    vendor: String(obj.vendor || "Unknown").trim() || "Unknown",
+    category,
+    description: String(obj.description || "").trim(),
+  };
 }
 
 // =====================
-// DB OPS
+// AI Extract (Receipt Image)
 // =====================
-async function saveTx(tgUserId, tx, rawText) {
+async function extractExpenseFromImageDataUrl(dataUrl) {
+  if (!openai) throw new Error("OpenAI disabled");
+  const today = todayISO();
+
+  const res = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          "Return ONLY JSON with keys: tx_date, amount, currency, vendor, category, description. " +
+          "tx_date format YYYY-MM-DD. amount is number. currency like SAR. " +
+          `category must be one of: ${CATEGORIES.join(", ")}.`,
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              `Today is ${today}.\n` +
+              `Extract ONE expense from this receipt/invoice image.\n` +
+              `Pick FINAL total (Grand Total / Total / الإجمالي / المجموع النهائي) not subtotal.\n` +
+              `If currency missing and Arabic/ريال -> SAR.\n` +
+              `Vendor = store/restaurant name.\n` +
+              `If date missing use today.\n` +
+              `Description = short.\n` +
+              `Return JSON only.`,
+          },
+          {
+            type: "image_url",
+            image_url: { url: dataUrl },
+          },
+        ],
+      },
+    ],
+  });
+
+  const raw = res.choices?.[0]?.message?.content?.trim() || "{}";
+  const obj = JSON.parse(raw);
+
+  const amount = Number(obj.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid amount");
+
+  const tx_date = String(obj.tx_date || today).slice(0, 10);
+
+  let currency = String(obj.currency || "SAR").trim().toUpperCase();
+  if (currency === "SR" || currency === "ريال") currency = "SAR";
+
+  let category = String(obj.category || "Uncategorized").trim() || "Uncategorized";
+  if (!CATEGORIES.includes(category)) category = "Uncategorized";
+
+  return {
+    tx_date,
+    amount,
+    currency,
+    vendor: String(obj.vendor || "Unknown").trim() || "Unknown",
+    category,
+    description: String(obj.description || "Receipt").trim(),
+  };
+}
+
+// =====================
+// DB Ops
+// =====================
+async function saveTx(tgUserId, tx, rawText, source) {
   if (!pool) return "NO_DB";
   try {
     await pool.query(
-      `insert into tx (tg_user_id, tx_date, amount, currency, vendor, category, description, raw_text)
-       values ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [tgUserId, tx.tx_date, tx.amount, tx.currency, tx.vendor, tx.category, tx.description, rawText]
+      `insert into tx (tg_user_id, tx_date, amount, currency, vendor, category, description, raw_text, source)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [tgUserId, tx.tx_date, tx.amount, tx.currency, tx.vendor, tx.category, tx.description, rawText, source]
     );
     return "OK";
   } catch (e) {
@@ -231,54 +285,87 @@ async function saveTx(tgUserId, tx, rawText) {
   }
 }
 
-async function getBudget(tgUserId, month, category) {
-  if (!pool) return null;
-  const r = await pool.query(
-    `select amount::numeric as budget, currency
-     from budgets
-     where tg_user_id=$1 and month=$2 and category=$3`,
-    [tgUserId, month, category]
+async function setBudget(tgUserId, month, category, amount) {
+  await pool.query(
+    `insert into budgets (tg_user_id, month, category, amount, currency)
+     values ($1,$2,$3,$4,'SAR')
+     on conflict (tg_user_id, month, category)
+     do update set amount=excluded.amount, currency='SAR'`,
+    [tgUserId, month, category, amount]
   );
-  return r.rowCount ? { budget: safeNum(r.rows[0].budget), currency: r.rows[0].currency } : null;
 }
 
-async function getSpent(tgUserId, month, category) {
-  if (!pool) return 0;
-  const r = await pool.query(
-    `select coalesce(sum(amount),0)::numeric as spent
-     from tx
-     where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2 and category=$3`,
-    [tgUserId, month, category]
+async function listBudgetsWithSpent(tgUserId, month) {
+  const buds = await pool.query(
+    `select category, amount::numeric as budget
+     from budgets
+     where tg_user_id=$1 and month=$2
+     order by category asc`,
+    [tgUserId, month]
   );
-  return safeNum(r.rows[0]?.spent || 0);
+
+  const spent = await pool.query(
+    `select category, coalesce(sum(amount),0)::numeric as total
+     from tx
+     where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
+     group by category`,
+    [tgUserId, month]
+  );
+
+  const spentMap = new Map(spent.rows.map((x) => [x.category, safeNum(x.total)]));
+  return buds.rows.map((b) => {
+    const s = spentMap.get(b.category) || 0;
+    const bud = safeNum(b.budget);
+    const pct = bud > 0 ? Math.round((s / bud) * 100) : 0;
+    return { category: b.category, spent: s, budget: bud, pct };
+  });
 }
 
 async function checkBudgetAlerts(ctx, tgUserId, tx) {
   if (!pool) return;
-
   const month = String(tx.tx_date).slice(0, 7);
-  const b = await getBudget(tgUserId, month, tx.category);
-  if (!b || !Number.isFinite(b.budget) || b.budget <= 0) return;
+  const b = await pool.query(
+    `select amount::numeric as budget from budgets where tg_user_id=$1 and month=$2 and category=$3`,
+    [tgUserId, month, tx.category]
+  );
+  if (!b.rowCount) return;
 
-  const spent = await getSpent(tgUserId, month, tx.category);
-  const pct = (spent / b.budget) * 100;
+  const budget = safeNum(b.rows[0].budget);
+  if (budget <= 0) return;
+
+  const s = await pool.query(
+    `select coalesce(sum(amount),0)::numeric as spent
+     from tx
+     where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2 and category=$3`,
+    [tgUserId, month, tx.category]
+  );
+  const spent = safeNum(s.rows[0].spent);
+  const pct = (spent / budget) * 100;
 
   if (pct >= 100) {
-    await ctx.reply(
-      `🚨 تجاوزت الميزانية لفئة ${tx.category} في ${month}\n` +
-        `${formatMoney(spent)} / ${formatMoney(b.budget)} ${CURRENCY_DEFAULT}`
-    );
+    await ctx.reply(`🚨 تجاوزت ميزانية ${tx.category} لشهر ${month}\n${formatMoney(spent)} / ${formatMoney(budget)} SAR`);
   } else if (pct >= 80) {
-    await ctx.reply(
-      `⚠️ وصلت 80% من ميزانية ${tx.category} في ${month}\n` +
-        `${formatMoney(spent)} / ${formatMoney(b.budget)} ${CURRENCY_DEFAULT}`
-    );
+    await ctx.reply(`⚠️ وصلت 80% من ميزانية ${tx.category} لشهر ${month}\n${formatMoney(spent)} / ${formatMoney(budget)} SAR`);
   }
 }
 
 // =====================
-// PDF (NO OVERLAP + ARABIC FONT)
+// PDF (Arabic via Cairo)
 // =====================
+function registerArabicFont(doc) {
+  try {
+    const abs = path.isAbsolute(AR_FONT_PATH) ? AR_FONT_PATH : path.join(process.cwd(), AR_FONT_PATH);
+    if (fs.existsSync(abs)) doc.registerFont("AR", abs);
+  } catch (_) {}
+}
+
+function fontForText(doc, text) {
+  // basic arabic detection
+  const isAr = /[\u0600-\u06FF]/.test(text || "");
+  if (isAr && doc._registeredFonts?.AR) return doc.font("AR");
+  return doc.font("Helvetica");
+}
+
 function collectPdfBuffer(doc) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -289,23 +376,6 @@ function collectPdfBuffer(doc) {
   });
 }
 
-function absFontPath(p) {
-  return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
-}
-
-function registerFonts(doc) {
-  try {
-    const abs = absFontPath(AR_FONT_PATH);
-    if (fs.existsSync(abs)) doc.registerFont("AR", abs);
-  } catch (_) {}
-}
-
-function setFont(doc, text) {
-  // If Arabic and registered, use it, else Helvetica
-  if (hasArabic(text) && doc._registeredFonts?.AR) doc.font("AR");
-  else doc.font("Helvetica");
-}
-
 function drawHeader(doc, title, sub) {
   doc.font("Helvetica").fontSize(16).text(COMPANY_NAME, 40, 40);
   doc.font("Helvetica").fontSize(14).text(title, 40, 62);
@@ -314,69 +384,63 @@ function drawHeader(doc, title, sub) {
   doc.y = 140;
 }
 
-function drawTableHeader(doc, cols, startX, y, headerH) {
+function drawTable(doc, cols, rows) {
+  const startX = 40;
+  let y = doc.y;
+  const headerH = 22;
+  const paddingX = 4;
+  const paddingY = 6;
+  const pageBottomY = 780;
+  const minRowH = 20;
+
   const totalW = cols.reduce((s, c) => s + c.w, 0);
   doc.rect(startX, y, totalW, headerH).fill("#f0f0f0");
   doc.fillColor("#000").fontSize(10).font("Helvetica");
 
   let x = startX;
   for (const c of cols) {
-    doc.text(c.h, x + 4, y + 6, { width: c.w - 8 });
+    doc.text(c.h, x + paddingX, y + 6, { width: c.w - paddingX * 2 });
     x += c.w;
   }
-  return y + headerH;
-}
-
-function drawTableDynamic(doc, cols, rows, options = {}) {
-  const startX = options.startX ?? 40;
-  const pageBottomY = options.pageBottomY ?? 780;
-  const headerH = options.headerH ?? 22;
-  const paddingX = options.paddingX ?? 4;
-  const paddingY = options.paddingY ?? 6;
-  const minRowH = options.minRowH ?? 20;
-
-  doc.fontSize(10);
-
-  let y = options.startY ?? doc.y;
-  y = drawTableHeader(doc, cols, startX, y, headerH);
+  y += headerH;
 
   for (const row of rows) {
     let rowH = minRowH;
 
-    // compute row height by measuring each cell
+    // calc dynamic height
     for (let i = 0; i < cols.length; i++) {
-      const raw = normalizeCell(row[i]);
+      const cell = String(row[i] ?? "").replace(/\s+/g, " ").trim();
       const w = cols[i].w - paddingX * 2;
-
-      setFont(doc, raw);
-      const h = doc.heightOfString(raw || " ", { width: w, align: "left" });
+      fontForText(doc, cell);
+      const h = doc.heightOfString(cell || " ", { width: w, align: "left" });
       doc.font("Helvetica");
-
-      const needed = h + paddingY * 2;
-      if (needed > rowH) rowH = needed;
+      rowH = Math.max(rowH, h + paddingY * 2);
     }
 
-    // page break
     if (y + rowH > pageBottomY) {
       doc.addPage();
       y = 60;
-      y = drawTableHeader(doc, cols, startX, y, headerH);
+
+      // redraw header
+      doc.rect(startX, y, totalW, headerH).fill("#f0f0f0");
+      doc.fillColor("#000").fontSize(10).font("Helvetica");
+      x = startX;
+      for (const c of cols) {
+        doc.text(c.h, x + paddingX, y + 6, { width: c.w - paddingX * 2 });
+        x += c.w;
+      }
+      y += headerH;
     }
 
-    // draw cells
-    let x = startX;
+    x = startX;
     for (let i = 0; i < cols.length; i++) {
       const w = cols[i].w;
-
       doc.rect(x, y, w, rowH).strokeColor("#dddddd").stroke();
       doc.strokeColor("#000000");
 
-      const raw = normalizeCell(row[i]);
-      setFont(doc, raw);
-      doc.text(raw, x + paddingX, y + paddingY, {
-        width: w - paddingX * 2,
-        align: "left",
-      });
+      const cell = String(row[i] ?? "").replace(/\s+/g, " ").trim();
+      fontForText(doc, cell);
+      doc.text(cell, x + paddingX, y + paddingY, { width: w - paddingX * 2, align: "left" });
       doc.font("Helvetica");
 
       x += w;
@@ -388,53 +452,7 @@ function drawTableDynamic(doc, cols, rows, options = {}) {
   doc.y = y + 12;
 }
 
-async function buildTodayPdf(tgUserId) {
-  const d = todayISO();
-
-  // IMPORTANT: tx_date returned as string => no 00:00:00
-  const r = await pool.query(
-    `select to_char(tx_date,'YYYY-MM-DD') as tx_date,
-            amount::numeric as amount, currency, vendor, category, description
-     from tx
-     where tg_user_id=$1 and tx_date=$2
-     order by created_at desc`,
-    [tgUserId, d]
-  );
-
-  const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
-
-  const doc = new PDFDocument({ size: "A4", margin: 40 });
-  registerFonts(doc);
-  drawHeader(doc, "Daily Expense Report", `Date: ${d} | Currency: ${CURRENCY_DEFAULT}`);
-
-  doc.font("Helvetica").fontSize(11).text(`Total: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
-  doc.y += 10;
-
-  const cols = [
-    { h: "Date", w: 70 },
-    { h: "Amount", w: 80 },
-    { h: "Category", w: 90 },
-    { h: "Vendor", w: 160 },
-    { h: "Notes", w: 155 },
-  ];
-
-  const rows = r.rows.map((x) => [
-    fmtDate(x.tx_date),
-    `${formatMoney(x.amount)} ${x.currency || CURRENCY_DEFAULT}`,
-    x.category || "",
-    x.vendor || "",
-    x.description || "",
-  ]);
-
-  if (!rows.length) doc.font("Helvetica").fontSize(12).text("No transactions found for today.");
-  else drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
-
-  doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
-  return await collectPdfBuffer(doc);
-}
-
 async function buildMonthPdf(tgUserId, month) {
-  // IMPORTANT: tx_date returned as string => no 00:00:00
   const tx = await pool.query(
     `select to_char(tx_date,'YYYY-MM-DD') as tx_date,
             amount::numeric as amount, currency, vendor, category, description
@@ -456,10 +474,10 @@ async function buildMonthPdf(tgUserId, month) {
   const total = byCat.rows.reduce((s, x) => s + safeNum(x.total), 0);
 
   const doc = new PDFDocument({ size: "A4", margin: 40 });
-  registerFonts(doc);
-  drawHeader(doc, "Monthly Expense Report", `Month: ${month} | Currency: ${CURRENCY_DEFAULT}`);
+  registerArabicFont(doc);
 
-  doc.font("Helvetica").fontSize(11).text(`Total: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
+  drawHeader(doc, "Monthly Expense Report", `Month: ${month} | Currency: SAR`);
+  doc.font("Helvetica").fontSize(11).text(`Total: ${formatMoney(total)} SAR`);
   doc.y += 12;
 
   doc.font("Helvetica").fontSize(12).text("Summary by Category");
@@ -467,16 +485,17 @@ async function buildMonthPdf(tgUserId, month) {
 
   const summaryCols = [
     { h: "Category", w: 260 },
-    { h: "Total", w: 120 },
+    { h: "Total (SAR)", w: 120 },
     { h: "Share", w: 135 },
   ];
+
   const summaryRows = byCat.rows.map((x) => {
     const t = safeNum(x.total);
     const pct = total > 0 ? `${Math.round((t / total) * 100)}%` : "0%";
-    return [x.category || "Uncategorized", `${formatMoney(t)} ${CURRENCY_DEFAULT}`, pct];
+    return [x.category || "Uncategorized", formatMoney(t), pct];
   });
 
-  if (summaryRows.length) drawTableDynamic(doc, summaryCols, summaryRows, { startY: doc.y, pageBottomY: 780 });
+  if (summaryRows.length) drawTable(doc, summaryCols, summaryRows);
   else doc.font("Helvetica").fontSize(11).text("No summary data.");
 
   doc.font("Helvetica").fontSize(12).text("Detailed Transactions");
@@ -491,25 +510,25 @@ async function buildMonthPdf(tgUserId, month) {
   ];
 
   const rows = tx.rows.map((x) => [
-    fmtDate(x.tx_date),
-    `${formatMoney(x.amount)} ${x.currency || CURRENCY_DEFAULT}`,
+    x.tx_date,
+    `${formatMoney(x.amount)} ${x.currency || "SAR"}`,
     x.category || "",
     x.vendor || "",
     x.description || "",
   ]);
 
-  if (!rows.length) doc.font("Helvetica").fontSize(12).text("No transactions found for this month.");
-  else drawTableDynamic(doc, cols, rows, { startY: doc.y, pageBottomY: 780 });
+  if (rows.length) drawTable(doc, cols, rows);
+  else doc.font("Helvetica").fontSize(12).text("No transactions found for this month.");
 
   doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated • ${new Date().toISOString()}`).fillColor("#000");
+
   return await collectPdfBuffer(doc);
 }
 
 // =====================
-// COMMANDS
+// Commands
 // =====================
 bot.command("ping", (ctx) => ctx.reply("pong ✅"));
-bot.command("version", (ctx) => ctx.reply("version: railway-bot-v1"));
 
 bot.command("env", (ctx) => {
   ctx.reply(
@@ -517,7 +536,23 @@ bot.command("env", (ctx) => {
       `model: ${OPENAI_MODEL}\n` +
       `db: ${DB_STATUS}\n` +
       `ar_font: ${AR_FONT_PATH}\n` +
-      (DB_ERROR ? `db_error: ${DB_ERROR.slice(0, 180)}` : "")
+      (DB_ERROR ? `db_error: ${DB_ERROR.slice(0, 220)}` : "")
+  );
+});
+
+bot.command("start", (ctx) => {
+  ctx.reply(
+    "✅ البوت شغال.\n\n" +
+      "📌 أدخل مصروف نص:\n" +
+      "دفعت 40 ريال للغداء من مطعم رائد البخاري\n\n" +
+      "📷 أو أرسل صورة فاتورة (Photo) وسيتم استخراج المصروف تلقائياً.\n\n" +
+      "أوامر:\n" +
+      "/today\n" +
+      "/month\n" +
+      "/setbudget Food 300\n" +
+      "/budget\n" +
+      "/exportpdf month\n" +
+      "/env"
   );
 });
 
@@ -541,10 +576,10 @@ bot.command("today", async (ctx) => {
     const total = r.rows.reduce((s, x) => s + safeNum(x.amount), 0);
     const lines = r.rows.map((x) => `- ${formatMoney(x.amount)} ${x.currency} | ${x.category} | ${x.vendor}`).join("\n");
 
-    return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
+    return ctx.reply(`📅 اليوم ${d}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
     console.error("TODAY_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في تقرير اليوم. راجع Logs.");
+    return ctx.reply("⚠️ خطأ في تقرير اليوم.");
   }
 });
 
@@ -566,12 +601,12 @@ bot.command("month", async (ctx) => {
     if (!r.rowCount) return ctx.reply(`📊 شهر ${m}: ما في مصروفات مسجلة.`);
 
     const total = r.rows.reduce((s, x) => s + safeNum(x.total), 0);
-    const lines = r.rows.map((x) => `- ${x.category}: ${formatMoney(x.total)} ${CURRENCY_DEFAULT}`).join("\n");
+    const lines = r.rows.map((x) => `- ${x.category}: ${formatMoney(x.total)} SAR`).join("\n");
 
-    return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} ${CURRENCY_DEFAULT}`);
+    return ctx.reply(`📊 ملخص شهر ${m}\n${lines}\n\nالمجموع: ${formatMoney(total)} SAR`);
   } catch (e) {
     console.error("MONTH_FAIL:", e);
-    return ctx.reply("⚠️ خطأ في تقرير الشهر. راجع Logs.");
+    return ctx.reply("⚠️ خطأ في تقرير الشهر.");
   }
 });
 
@@ -595,18 +630,11 @@ bot.command("setbudget", async (ctx) => {
       return ctx.reply("❌ صيغة الشهر غلط. استخدم YYYY-MM مثل: 2026-01");
     }
 
-    await pool.query(
-      `insert into budgets (tg_user_id, month, category, amount, currency)
-       values ($1,$2,$3,$4,$5)
-       on conflict (tg_user_id, month, category)
-       do update set amount=excluded.amount, currency=excluded.currency`,
-      [uid, month, category, amount, CURRENCY_DEFAULT]
-    );
-
-    return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${formatMoney(amount)} ${CURRENCY_DEFAULT}`);
+    await setBudget(uid, month, category, amount);
+    return ctx.reply(`✅ تم ضبط ميزانية ${category} لشهر ${month}: ${formatMoney(amount)} SAR`);
   } catch (e) {
     console.error("SETBUDGET_FAIL:", e);
-    return ctx.reply("⚠️ فشل ضبط الميزانية. راجع Logs.");
+    return ctx.reply("⚠️ فشل ضبط الميزانية.");
   }
 });
 
@@ -616,37 +644,14 @@ bot.command("budget", async (ctx) => {
     const uid = ctx.from.id;
     const month = thisMonthKey();
 
-    const buds = await pool.query(
-      `select category, amount::numeric as budget
-       from budgets
-       where tg_user_id=$1 and month=$2
-       order by category asc`,
-      [uid, month]
-    );
+    const rows = await listBudgetsWithSpent(uid, month);
+    if (!rows.length) return ctx.reply(`ما في ميزانيات لشهر ${month}.\nاستخدم: /setbudget Food 300`);
 
-    if (!buds.rowCount) return ctx.reply(`ما في ميزانيات لشهر ${month}.\nاستخدم: /setbudget Food 300`);
-
-    const spent = await pool.query(
-      `select category, coalesce(sum(amount),0)::numeric as total
-       from tx
-       where tg_user_id=$1 and to_char(tx_date,'YYYY-MM')=$2
-       group by category`,
-      [uid, month]
-    );
-
-    const spentMap = new Map(spent.rows.map((x) => [x.category, safeNum(x.total)]));
-
-    const lines = buds.rows.map((b) => {
-      const s = spentMap.get(b.category) || 0;
-      const bud = safeNum(b.budget);
-      const pct = bud > 0 ? Math.round((s / bud) * 100) : 0;
-      return `- ${b.category}: ${formatMoney(s)} / ${formatMoney(bud)} ${CURRENCY_DEFAULT} (${pct}%)`;
-    });
-
+    const lines = rows.map((x) => `- ${x.category}: ${formatMoney(x.spent)} / ${formatMoney(x.budget)} SAR (${x.pct}%)`);
     return ctx.reply(`📌 ميزانيات شهر ${month}\n${lines.join("\n")}`);
   } catch (e) {
     console.error("BUDGET_FAIL:", e);
-    return ctx.reply("⚠️ فشل عرض الميزانيات. راجع Logs.");
+    return ctx.reply("⚠️ فشل عرض الميزانيات.");
   }
 });
 
@@ -658,27 +663,21 @@ bot.command("exportpdf", async (ctx) => {
     const parts = (ctx.message?.text || "").trim().split(/\s+/);
     const mode = (parts[1] || "").toLowerCase();
 
-    if (mode === "today") {
-      const buf = await buildTodayPdf(uid);
-      return ctx.replyWithDocument({ source: buf, filename: `daily-report-${todayISO()}.pdf` });
-    }
+    if (mode !== "month") return ctx.reply("استخدم: /exportpdf month أو /exportpdf month 2026-01");
 
-    if (mode === "month") {
-      const m = (parts[2] || thisMonthKey()).trim();
-      if (!ensureMonthFormat(m)) return ctx.reply("صيغة الشهر غلط. استخدم YYYY-MM مثل 2026-01");
-      const buf = await buildMonthPdf(uid, m);
-      return ctx.replyWithDocument({ source: buf, filename: `monthly-report-${m}.pdf` });
-    }
+    const m = (parts[2] || thisMonthKey()).trim();
+    if (!ensureMonthFormat(m)) return ctx.reply("صيغة الشهر غلط. استخدم YYYY-MM مثل 2026-01");
 
-    return ctx.reply("استخدم: /exportpdf today أو /exportpdf month أو /exportpdf month 2026-01");
+    const buf = await buildMonthPdf(uid, m);
+    return ctx.replyWithDocument({ source: buf, filename: `monthly-report-${m}.pdf` });
   } catch (e) {
     console.error("EXPORTPDF_FAIL:", e);
-    return ctx.reply("⚠️ فشل تصدير PDF. راجع Logs.");
+    return ctx.reply("⚠️ فشل تصدير PDF.");
   }
 });
 
 // =====================
-// EXPENSE MESSAGE
+// TEXT expense
 // =====================
 bot.on("text", async (ctx) => {
   const text = (ctx.message?.text || "").trim();
@@ -687,7 +686,7 @@ bot.on("text", async (ctx) => {
   if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
 
   try {
-    const tx = await extractExpense(text);
+    const tx = await extractExpenseFromText(text);
 
     await ctx.reply(
       `✅ تم استخراج المصروف:\n` +
@@ -698,24 +697,70 @@ bot.on("text", async (ctx) => {
         `📝 ${tx.description || "-"}`
     );
 
-    const status = await saveTx(ctx.from.id, tx, text);
-
+    const status = await saveTx(ctx.from.id, tx, text, "TEXT");
     if (status === "OK") {
       await ctx.reply("💾 تم الحفظ.");
       await checkBudgetAlerts(ctx, ctx.from.id, tx);
       return;
     }
-
     if (status === "NO_DB") return ctx.reply("ℹ️ DB غير مفعلة. أضف DATABASE_URL.");
     return ctx.reply("⚠️ فشل الحفظ في DB. شوف /env");
   } catch (e) {
-    console.error("EXTRACT_FAIL:", e);
-    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: دفعت 25 ريال قهوة");
+    console.error("TEXT_EXTRACT_FAIL:", e);
+    return ctx.reply("❌ ما قدرت أفهم المصروف. مثال: غداء 40 ريال مطعم رائد البخاري");
   }
 });
 
 // =====================
-// LAUNCH
+// PHOTO receipt expense
+// =====================
+bot.on("photo", async (ctx) => {
+  try {
+    if (!openai) return ctx.reply("❌ OpenAI غير مفعّل. أضف OPENAI_API_KEY.");
+    if (!pool) return ctx.reply("DB غير جاهزة. شوف /env");
+
+    const photos = ctx.message?.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best?.file_id) return ctx.reply("❌ ما لقيت صورة واضحة.");
+
+    await ctx.reply("⏳ جاري قراءة الفاتورة...");
+
+    // Telegram file link -> download -> data URL
+    const link = await ctx.telegram.getFileLink(best.file_id);
+    const resp = await fetch(link.href);
+    if (!resp.ok) throw new Error(`Failed to download image: ${resp.status}`);
+
+    const contentType = resp.headers.get("content-type") || "image/jpeg";
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const b64 = buf.toString("base64");
+    const dataUrl = `data:${contentType};base64,${b64}`;
+
+    const tx = await extractExpenseFromImageDataUrl(dataUrl);
+
+    await ctx.reply(
+      `✅ تم استخراج الفاتورة:\n` +
+        `💰 ${formatMoney(tx.amount)} ${tx.currency}\n` +
+        `📅 ${tx.tx_date}\n` +
+        `🏪 ${tx.vendor}\n` +
+        `🏷️ ${tx.category}\n` +
+        `📝 ${tx.description || "-"}`
+    );
+
+    const status = await saveTx(ctx.from.id, tx, "RECEIPT_IMAGE", "IMAGE");
+    if (status === "OK") {
+      await ctx.reply("💾 تم الحفظ.");
+      await checkBudgetAlerts(ctx, ctx.from.id, tx);
+      return;
+    }
+    return ctx.reply("⚠️ تم الاستخراج لكن فشل الحفظ في DB. شوف /env");
+  } catch (e) {
+    console.error("PHOTO_RECEIPT_FAIL:", e);
+    return ctx.reply("⚠️ ما قدرت أقرأ الفاتورة. جرّب صورة أوضح (بدون قص) وبإضاءة كويسة.");
+  }
+});
+
+// =====================
+// Launch
 // =====================
 bot.catch((e) => console.error("BOT ERROR:", e));
 process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
@@ -724,8 +769,6 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
 (async () => {
   try {
     await initDb();
-
-    // ensure polling (no webhook)
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
     const me = await bot.telegram.getMe();
